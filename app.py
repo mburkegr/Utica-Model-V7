@@ -1,815 +1,1576 @@
 import os
-from functools import lru_cache
+import hashlib
+import json
 from datetime import date
+from io import BytesIO
 
-import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+import base64
 
-try:
-    import pyxirr
-except Exception:
-    pyxirr = None
+from model import (
+    run_deal_model,
+    run_deal_metrics,
+    load_type_curve_library,
+    load_price_file,
+    prepare_slot_inputs,
+    prepare_deal_settings,
+    prepare_global_assumptions,
+    calc_slot_metrics,
+    build_slot_ngl_factors,
+    run_single_slot_economics,
+)
+
+PRICE_FILE_PATH = "price_file_library.xlsx"
+
+st.set_page_config(page_title="Utica Deal Model", layout="wide")
 
 
+# ----------------------------- 
+# Helpers
 # -----------------------------
-# Library + utility helpers
-# -----------------------------
-def clean_tc_name(name):
-    return str(name).strip().lower().replace(" ", "_")
-
-
-@lru_cache(maxsize=8)
-def _load_type_curve_library_cached(file_path, file_mtime):
-    tc_monthly = pd.read_excel(file_path, sheet_name="tc_monthly")
-    tc_metadata = pd.read_excel(file_path, sheet_name="tc_metadata")
-
-    tc_monthly["tc_name"] = tc_monthly["tc_name"].map(clean_tc_name)
-    tc_metadata["tc_name"] = tc_metadata["tc_name"].map(clean_tc_name)
-
-    library = {}
-    for tc_name, monthly_df in tc_monthly.groupby("tc_name"):
-        meta_row = tc_metadata.loc[tc_metadata["tc_name"] == tc_name]
-        if meta_row.empty:
-            continue
-
-        library[tc_name] = {
-            "base_lateral": float(meta_row["base_lateral"].iloc[0]),
-            "monthly": monthly_df[["month", "oil", "gas"]].copy().sort_values("month"),
-        }
-
-    return library
-
-
-def load_type_curve_library(file_path="type_curve_library.xlsx"):
-    file_mtime = os.path.getmtime(file_path)
-    return _load_type_curve_library_cached(file_path, file_mtime)
-
-@lru_cache(maxsize=8)
-def _load_price_file_cached(file_path, file_mtime):
-    """Read and validate the monthly oil and gas pricing file."""
-
-    pricing_df = pd.read_excel(
-        file_path,
-        sheet_name="Data",
-    )
-
-    if pricing_df.empty:
-        raise ValueError(
-            "The pricing file does not contain any pricing rows."
-        )
-    
-    required_columns = {
-        "month",
-        "oil_price",
-        "gas_price",
+def pretty_column_name(col):
+    name_map = {
+        "date": "Date",
+        "slot_id": "Slot ID",
+        "tc_name": "Type Curve",
+        "index_oil_price": "Index Oil Price",
+        "index_gas_price": "Index Gas Price",
+        "slot_net_oil_production": "Net Oil Production",
+        "slot_net_gas_production": "Net Gas Production",
+        "slot_net_ngl_production": "Net NGL Production",
+        "slot_oil_revenue": "Net Oil Revenue",
+        "slot_gas_revenue": "Net Gas Revenue",
+        "slot_ngl_revenue": "Net NGL Revenue",
+        "slot_total_revenue": "Total Revenue",
+        "slot_loe": "Total LOE",
+        "slot_tax": "Total Tax",
+        "slot_operating_profit": "Operating Profit",
+        "slot_capex": "Capex",
+        "slot_asset_purchase": "Acquisition",
+        "dale_promote": "Dale Eligible",
+        "dale_unit_id": "Dale Unit ID",
+        "dale_payout_group": "Dale Payout Group",
+        "dale_first_well_carry": "Dale First-Well Carry",
+        "dale_initial_interest_pct": "Dale Initial Interest %",
+        "pre_dale_working_interest": "Original Pre-Dale WI",
+        "dale_initial_working_interest": "Dale Initial WI",
+        "post_initial_dale_working_interest": "Post-Initial-Dale WI",
+        "gr_parties_working_interest": "USEDC + Granite WI",
+        "gr_parties_net_wells": "USEDC + Granite Net Wells",
+        "dale_carry_dnc_net_wells": "Dale Carry Net Wells",
+        "funded_dnc_net_wells": "Funded D&C Net Wells",
+        "slot_promote_ocf": "Dale Payout OCF",
+        "slot_base_capex": "Base D&C Capex",
+        "slot_dale_carry_capex": "Dale Carry Capex",
+        "pre_promote_working_interest": "Pre-Reversion WI",
+        "promote_wi_transferred": "WI Transferred",
+        "post_promote_working_interest": "Post-Reversion WI",
+        "effective_working_interest": "Effective WI",
+        "promote_running_multiple": "Reversion Multiple",
+        "promote_hurdle_reached": "Reversion Hurdle Reached",
+        "promote_active": "Reversion Active",
+        "promote_hurdle_date": "Reversion Hurdle Date",
+        "promote_effective_date": "Reversion Effective Date",
+        "slot_total_cash_flow": "Total Cash Flow",
+        "cum_total_cf": "Cumulative Total Cash Flow",
+        "economic_limit_reached": "Economic Limit Reached",
+        "well_shut_in": "Well Shut In",
+        "pre_shut_in_operating_cf": "Pre-Shut-In Operating CF",
     }
+    return name_map.get(col, col.replace("_", " ").title())
 
-    missing_columns = required_columns - set(pricing_df.columns)
 
-    if missing_columns:
-        raise ValueError(
-            "Pricing file is missing required columns: "
-            + ", ".join(sorted(missing_columns))
-        )
+def is_effectively_zero(x, tol=1e-9):
+    return pd.notnull(x) and abs(float(x)) < tol
 
-    pricing_df = pricing_df[
-        [
-            "month",
-            "oil_price",
-            "gas_price",
-        ]
-    ].copy()
 
-    # This works whether Excel stores the month as an actual date
-    # or as text such as 01/01/2026.
-    pricing_df["month"] = pd.to_datetime(
-        pricing_df["month"],
-        errors="coerce",
+def format_accounting_number(
+    x,
+    decimals=1,
+    prefix="",
+    suffix="",
+    zero_as_dash=True,
+    null_as_blank=True,
+):
+    if pd.isnull(x):
+        return "" if null_as_blank else "-"
+
+    x = float(x)
+
+    if zero_as_dash and is_effectively_zero(x):
+        return "-"
+
+    abs_text = f"{abs(x):,.{decimals}f}"
+    text = f"{prefix}{abs_text}{suffix}"
+
+    return f"({text})" if x < 0 else text
+
+
+def format_accounting_percent(
+    x,
+    decimals=0,
+    zero_as_dash=True,
+    null_as_blank=True,
+):
+    if pd.isnull(x):
+        return "" if null_as_blank else "-"
+
+    x = float(x)
+
+    if zero_as_dash and is_effectively_zero(x):
+        return "-"
+
+    abs_text = f"{abs(x):.{decimals}%}"
+    return f"({abs_text})" if x < 0 else abs_text
+
+
+def format_accounting_production(
+    x,
+    large_decimals=0,
+    small_decimals=2,
+    threshold=10,
+    zero_as_dash=True,
+    null_as_blank=True,
+):
+    if pd.isnull(x):
+        return "" if null_as_blank else "-"
+
+    x = float(x)
+
+    if zero_as_dash and is_effectively_zero(x):
+        return "-"
+
+    decimals = large_decimals if abs(x) >= threshold else small_decimals
+    abs_text = f"{abs(x):,.{decimals}f}"
+    return f"({abs_text})" if x < 0 else abs_text
+
+
+def format_display_df(df):
+    display_df = df.copy()
+
+    price_decimals = {
+        "index_oil_price": 2,
+        "index_gas_price": 3,
+    }
+    
+    percent_cols = {
+        "working_interest",
+        "pre_dale_working_interest",
+        "dale_initial_interest_pct",
+        "dale_initial_working_interest",
+        "post_initial_dale_working_interest",
+        "gr_parties_working_interest",
+        "pre_carry_working_interest",
+        "post_carry_working_interest",
+        "pre_promote_working_interest",
+        "promote_wi_transferred",
+        "post_promote_working_interest",
+        "effective_working_interest",
+    }
+    multiple_cols = {"promote_running_multiple"}
+
+    for col in display_df.columns:
+        if pd.api.types.is_datetime64_any_dtype(display_df[col]):
+            display_df[col] = display_df[col].dt.strftime("%Y-%m-%d")
+        elif pd.api.types.is_bool_dtype(display_df[col]):
+            display_df[col] = display_df[col].map(
+                lambda x: "Yes" if bool(x) else "No"
+            )
+        elif col in price_decimals:
+            display_df[col] = display_df[col].map(
+                lambda x: format_accounting_number(
+                    x,
+                    decimals=price_decimals[col],
+                    prefix="$",
+                    zero_as_dash=False,
+                )
+            )
+        elif col in percent_cols:
+            display_df[col] = display_df[col].map(
+                lambda x: format_accounting_percent(
+                    x,
+                    decimals=2,
+                    zero_as_dash=False,
+                )
+            )
+        elif col in multiple_cols:
+            display_df[col] = display_df[col].map(
+                lambda x: format_accounting_number(
+                    x,
+                    decimals=2,
+                    suffix="x",
+                    zero_as_dash=False,
+                )
+            )
+        elif pd.api.types.is_numeric_dtype(display_df[col]):
+            display_df[col] = display_df[col].map(
+                lambda x: format_accounting_number(x, decimals=1)
+            )
+
+    display_df.columns = [pretty_column_name(col) for col in display_df.columns]
+    return display_df
+
+
+def format_thousands_short(
+    x,
+    decimals=1,
+    prefix="$",
+    suffix="k",
+    zero_as_dash=True,
+    null_as_blank=True,
+):
+    if pd.isnull(x):
+        return "" if null_as_blank else "-"
+
+    x = float(x)
+
+    if zero_as_dash and is_effectively_zero(x):
+        return "-"
+
+    x_thousands = x / 1000.0
+    abs_text = f"{abs(x_thousands):,.{decimals}f}"
+    text = f"{prefix}{abs_text}{suffix}"
+
+    return f"({text})" if x < 0 else text
+
+
+QUARTERLY_HEADER_COLOR = "#4E80B1"
+BUTTON_DARK = "#2E4D6A"
+MONTHLY_BTN = "#C0D4E4"
+YEAR_FILL = "#CADEEE"
+
+
+def inject_app_css():
+    st.markdown(
+        f"""
+        <style>
+        div[data-testid="stButton"] button[kind="primary"] {{
+            background-color: {BUTTON_DARK} !important;
+            color: white !important;
+            border: 1px solid {BUTTON_DARK} !important;
+            font-weight: 700 !important;
+            border-radius: 10px !important;
+        }}
+
+        div[data-testid="stButton"] button[kind="primary"]:hover,
+        div[data-testid="stButton"] button[kind="primary"]:focus,
+        div[data-testid="stButton"] button[kind="primary"]:active {{
+            background-color: {BUTTON_DARK} !important;
+            color: white !important;
+            border: 1px solid {BUTTON_DARK} !important;
+            box-shadow: none !important;
+            filter: brightness(1.05) !important;
+        }}
+
+        div[data-testid="stButton"] button[kind="secondary"] {{
+            background-color: {MONTHLY_BTN} !important;
+            color: #1f2d3d !important;
+            border: 1px solid {MONTHLY_BTN} !important;
+            font-weight: 700 !important;
+            border-radius: 10px !important;
+        }}
+
+        div[data-testid="stButton"] button[kind="secondary"]:hover,
+        div[data-testid="stButton"] button[kind="secondary"]:focus,
+        div[data-testid="stButton"] button[kind="secondary"]:active {{
+            background-color: {MONTHLY_BTN} !important;
+            color: #1f2d3d !important;
+            border: 1px solid {MONTHLY_BTN} !important;
+            box-shadow: none !important;
+            filter: brightness(1.05) !important;
+        }}
+
+        div[data-testid="stDownloadButton"] button {{
+            background-color: {MONTHLY_BTN} !important;
+            color: #1f2d3d !important;
+            border: 1px solid {MONTHLY_BTN} !important;
+            font-weight: 700 !important;
+            border-radius: 10px !important;
+        }}
+
+        div[data-testid="stDownloadButton"] button:hover {{
+            background-color: {MONTHLY_BTN} !important;
+            filter: brightness(1.03) !important;
+        }}
+
+        div[data-testid="stFormSubmitButton"] button {{
+            background-color: #2E4D6A !important;
+            color: white !important;
+            border: 1px solid #2E4D6A !important;
+            font-weight: 700 !important;
+            border-radius: 10px !important;
+        }}
+        
+        div[data-testid="stFormSubmitButton"] button:hover {{
+            filter: brightness(1.05) !important;
+        }}
+
+        div[data-testid="stExpander"] summary {{
+            background-color: {QUARTERLY_HEADER_COLOR} !important;
+            color: white !important;
+            border-radius: 10px !important;
+            font-weight: 700 !important;
+            padding: 8px 12px !important;
+        }}
+
+        div[data-testid="stDataEditor"] [role="columnheader"],
+        div[data-testid="stDataEditor"] thead th {{
+            background-color: {QUARTERLY_HEADER_COLOR} !important;
+            color: white !important;
+            font-weight: 700 !important;
+        }}
+
+        div[data-testid="stDataEditor"] [role="columnheader"] *,
+        div[data-testid="stDataEditor"] thead th * {{
+            color: white !important;
+            fill: white !important;
+            font-weight: 700 !important;
+        }}
+
+        div[data-testid="stDataEditor"] [role="gridcell"] {{
+            border-color: #e6e6e6 !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    pricing_df["oil_price"] = pd.to_numeric(
-        pricing_df["oil_price"],
-        errors="coerce",
-    )
 
-    pricing_df["gas_price"] = pd.to_numeric(
-        pricing_df["gas_price"],
-        errors="coerce",
-    )
-
-    if pricing_df["month"].isna().any():
-        raise ValueError(
-            "The pricing file contains one or more invalid months."
-        )
-
-    if pricing_df[["oil_price", "gas_price"]].isna().any().any():
-        raise ValueError(
-            "The pricing file contains one or more invalid oil or gas prices."
-        )
-
-    # Normalize every date to the first day of its month.
-    pricing_df["month"] = (
-        pricing_df["month"]
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-
-    pricing_df = (
-        pricing_df
-        .sort_values("month")
-        .reset_index(drop=True)
-    )
-
-    duplicate_months = pricing_df.loc[
-        pricing_df["month"].duplicated(keep=False),
-        "month",
-    ]
-
-    if not duplicate_months.empty:
-        duplicate_text = ", ".join(
-            duplicate_months.dt.strftime("%b %Y").unique()
-        )
-
-        raise ValueError(
-            f"The pricing file contains duplicate months: {duplicate_text}"
-        )
-
-    # Verify that there are no missing months inside the deck.
-    expected_months = pd.date_range(
-        start=pricing_df["month"].min(),
-        end=pricing_df["month"].max(),
-        freq="MS",
-    )
-
-    actual_months = pd.DatetimeIndex(pricing_df["month"])
-
-    missing_months = expected_months.difference(actual_months)
-
-    if not missing_months.empty:
-        missing_text = ", ".join(
-            missing_months.strftime("%b %Y")
-        )
-
-        raise ValueError(
-            f"The pricing file is missing monthly pricing for: {missing_text}"
-        )
-
-    return pricing_df
+inject_app_css()
+st.title("Utica Deal Model")
 
 
-def load_price_file(file_path="price_file_library.xlsx"):
-    """Load the pricing file and refresh the cache when GitHub updates it."""
+@st.cache_data(show_spinner=False)
+def load_tc_names(file_mtime):
+    tc_metadata = pd.read_excel("type_curve_library.xlsx", sheet_name="tc_metadata")
+    tc_metadata["tc_name"] = tc_metadata["tc_name"].astype(str).str.strip()
+    return tc_metadata["tc_name"].dropna().unique().tolist()
 
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(
-            f"Pricing file was not found: {file_path}"
-        )
 
-    file_mtime = os.path.getmtime(file_path)
-
-    return _load_price_file_cached(
-        file_path,
-        file_mtime,
-    ).copy()
-
-def default_effective_date():
+def next_month_start():
     today = date.today()
     if today.month == 12:
-        return pd.Timestamp(today.year + 1, 1, 1)
-    return pd.Timestamp(today.year, today.month + 1, 1)
+        return date(today.year + 1, 1, 1)
+    return date(today.year, today.month + 1, 1)
 
-def build_index_price_series(
-    dates,
-    global_assumptions,
-):
+
+def default_flat_start_date():
+    """Return the first day of the month exactly 48 months from now.
+
+    Example:
+        August 2026 -> August 1, 2030
     """
-    Build the monthly WTI and Henry Hub pricing series.
-
-    Flat mode:
-        Uses the app-entered oil and gas prices for every month.
-
-    File mode:
-        Uses the pricing file before each commodity's switch date.
-        Uses the app-entered flat price beginning with the switch month.
-    """
-
-    output = pd.DataFrame({
-        "date": pd.to_datetime(pd.Series(dates))
-    })
-
-    output["date"] = (
-        output["date"]
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-
-    pricing_mode = str(
-        global_assumptions.get("pricing_mode", "flat")
-    ).lower()
-
-    terminal_oil_price = float(
-        global_assumptions["oil_price"]
-    )
-
-    terminal_gas_price = float(
-        global_assumptions["gas_price"]
-    )
-
-    # Preserve your current flat-pricing behavior.
-    if pricing_mode == "flat":
-        output["index_oil_price"] = terminal_oil_price
-        output["index_gas_price"] = terminal_gas_price
-
-        return output[
-            [
-                "date",
-                "index_oil_price",
-                "index_gas_price",
-            ]
-        ]
-
-    if pricing_mode != "file":
-        raise ValueError(
-            f"Unsupported pricing mode: {pricing_mode}"
-        )
-
-    pricing_file_path = global_assumptions.get(
-        "pricing_file_path",
-        "price_file_library.xlsx",
-    )
-
-    pricing_deck = load_price_file(
-        pricing_file_path
-    ).rename(
-        columns={
-            "month": "date",
-            "oil_price": "deck_oil_price",
-            "gas_price": "deck_gas_price",
-        }
-    )
-
-    output = output.merge(
-        pricing_deck,
-        on="date",
-        how="left",
-    )
-
-    oil_flat_start_date = (
-        pd.Timestamp(
-            global_assumptions["oil_flat_start_date"]
-        )
+    current_month = (
+        pd.Timestamp(date.today())
         .to_period("M")
         .to_timestamp()
     )
+    return (
+        current_month
+        + pd.DateOffset(months=48)
+    ).date()
 
-    gas_flat_start_date = (
-        pd.Timestamp(
-            global_assumptions["gas_flat_start_date"]
-        )
-        .to_period("M")
-        .to_timestamp()
-    )
 
-    # These base values stay unchanged during sensitivities.
-    base_oil_price = float(
-        global_assumptions.get(
-            "base_oil_price",
-            terminal_oil_price,
-        )
-    )
-
-    base_gas_price = float(
-        global_assumptions.get(
-            "base_gas_price",
-            terminal_gas_price,
-        )
-    )
-
-    # This allows your existing sensitivity functions to shift
-    # the entire pricing curve.
-    oil_curve_shift = (
-        terminal_oil_price - base_oil_price
-    )
-
-    gas_curve_shift = (
-        terminal_gas_price - base_gas_price
-    )
-
-    output["index_oil_price"] = np.where(
-        output["date"] >= oil_flat_start_date,
-        terminal_oil_price,
-        output["deck_oil_price"] + oil_curve_shift,
-    )
-
-    output["index_gas_price"] = np.where(
-        output["date"] >= gas_flat_start_date,
-        terminal_gas_price,
-        output["deck_gas_price"] + gas_curve_shift,
-    )
-
-    # Only require file pricing before the applicable flat date.
-    missing_oil_mask = (
-        output["date"].lt(oil_flat_start_date)
-        & output["index_oil_price"].isna()
-    )
-
-    missing_gas_mask = (
-        output["date"].lt(gas_flat_start_date)
-        & output["index_gas_price"].isna()
-    )
-
-    if missing_oil_mask.any():
-        missing_dates = output.loc[
-            missing_oil_mask,
-            "date",
-        ].dt.strftime("%b %Y")
-
-        raise ValueError(
-            "The pricing file does not contain oil pricing for "
-            + ", ".join(missing_dates.unique()[:5])
-            + ". Either add those months to the file or select "
-            "an earlier oil flat-pricing date."
-        )
-
-    if missing_gas_mask.any():
-        missing_dates = output.loc[
-            missing_gas_mask,
-            "date",
-        ].dt.strftime("%b %Y")
-
-        raise ValueError(
-            "The pricing file does not contain gas pricing for "
-            + ", ".join(missing_dates.unique()[:5])
-            + ". Either add those months to the file or select "
-            "an earlier gas flat-pricing date."
-        )
-
-    return output[
-        [
-            "date",
-            "index_oil_price",
-            "index_gas_price",
-        ]
-    ]
-
-# -----------------------------
-# NGL factors
-# -----------------------------
-def build_slot_ngl_factors(
-    slot,
-    global_assumptions,
-    content_percentages,
-    recover_ethane_percentages,
-    reject_ethane_percentages,
-    ngl_prices,
-    ngl_shrink_factors,
-):
-    ngl_yield = float(slot["ngl_yield"])
-
-    if int(global_assumptions["ethane_rec"]) == 1:
-        recoveries = recover_ethane_percentages
-        recovery_case = "recover"
-    else:
-        recoveries = reject_ethane_percentages
-        recovery_case = "reject"
-
+def build_slot_template(num_slots):
     rows = []
-
-    for component in content_percentages:
-        content_pct = float(content_percentages[component])
-        implied_ngl_content = content_pct * ngl_yield
-        recovery_pct = float(recoveries[component])
-        sales_volume_factor = implied_ngl_content * recovery_pct
-        shrink_factor = float(ngl_shrink_factors[component])
-        shrink_contribution = sales_volume_factor * shrink_factor
-        component_price = float(ngl_prices[component])
-
+    for i in range(1, num_slots + 1):
         rows.append(
             {
-                "component": component,
-                "content_pct": content_pct,
-                "implied_ngl_content": implied_ngl_content,
-                "recovery_pct": recovery_pct,
-                "sales_volume_factor": sales_volume_factor,
-                "shrink_factor": shrink_factor,
-                "shrink_contribution": shrink_contribution,
-                "component_price": component_price,
+                "include_slot": True,
+                "dale_promote": False,
+                "dale_unit_id": f"UNIT-{i}",
+                "dale_payout_group": f"UNIT-{i}",
+                "dale_first_well_carry": False,
+                "carry_enabled": False,
+                "carry_wi_reversion_pct": 0.0,
+                "slot_id": i,
+                "tc_name": "Choose TC",
+                "gross_wells": 1.0,
+                "net_acres": 25.0,
+                "unit_acres": 200.0,
+                "use_calc_unit_acres": False,
+                "pct_unitized": 1.0,
+                "drilling_spud_month": next_month_start(),
+                "flowback_delay": 4,
+                "net_revenue_interest": 0.80,
+                "lateral_length": 15000,
+                "dc_costs": 750.0,
+                "tc_risk": 1.00,
+                "bid_per_acre": 8000.0,
+                "oil_diff": -10.00,
+                "gas_diff": -2.75,
+                "ngl_diff": 0.00,
+                "oil_opex_bbl": 1.78,
+                "gas_opex_mcf": 0.25,
+                "ngl_opex": 2.50,
+                "fixed_loe": 3534.0,
+                "ngl_yield": 4.2,
             }
         )
+    return pd.DataFrame(rows)
 
-    ngl_detail_df = pd.DataFrame(rows)
 
-    shrink = float(ngl_detail_df["shrink_contribution"].sum())
+SENSITIVITY_ONLY_INPUT_KEYS = {
+    "use_tc_risk_as_main_sensitivity",
+    "use_dc_pct_sensitivity",
+}
 
-    aggregate_ngl_price = float(
-        (
-            ngl_detail_df["recovery_pct"]
-            * ngl_detail_df["content_pct"]
-            * ngl_detail_df["component_price"]
-        ).sum()
-    )
 
-    ngl_pct_of_wti = aggregate_ngl_price * 42.0 / 60.0
+def _signature_json_default(value):
+    if isinstance(value, (pd.Timestamp, date)):
+        return pd.Timestamp(value).isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
 
-    return {
-        "recovery_case": recovery_case,
-        "recoveries": recoveries,
-        "detail_df": ngl_detail_df,
-        "shrink": shrink,
-        "aggregate_ngl_price": aggregate_ngl_price,
-        "ngl_pct_of_wti": ngl_pct_of_wti,
+
+def build_model_input_signature(slot_df, deal_inputs):
+    """Create a stable signature for assumptions that affect the base case."""
+    signature_inputs = {
+        key: value
+        for key, value in deal_inputs.items()
+        if key not in SENSITIVITY_ONLY_INPUT_KEYS
     }
 
-
-# -----------------------------
-# Slot metrics
-# -----------------------------
-def calc_slot_metrics(slot, deal_settings, total_net_acres):
-    slot = slot.copy()
-
-    if bool(deal_settings["use_bid_override"]):
-        bid_price_final = max(1.0, float(deal_settings["bid_override"]))
-    else:
-        bid_price_final = max(1.0, float(slot["bid_per_acre"]))
-
-    if bool(slot["use_calc_unit_acres"]):
-        unit_acres_final = (
-            float(slot["gross_wells"]) * float(slot["lateral_length"]) / 50.0
-        )
-    else:
-        unit_acres_final = float(slot["unit_acres"])
-
-    if unit_acres_final == 0:
-        working_interest = 0.0
-    else:
-        working_interest = (
-            float(slot["net_acres"]) / unit_acres_final
-        ) * float(slot["pct_unitized"])
-
-    net_wells = working_interest * float(slot["gross_wells"])
-
-    use_acquisition_override = bool(
-        deal_settings.get("use_acquisition_override", False)
+    slot_payload = slot_df.copy().to_json(
+        orient="split",
+        date_format="iso",
+        double_precision=12,
     )
-    acquisition_cost_override = float(
-        deal_settings.get("acquisition_cost_override", 0.0)
+    payload = {
+        "deal_inputs": signature_inputs,
+        "slot_df": json.loads(slot_payload),
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_signature_json_default,
     )
-
-    if use_acquisition_override:
-        if total_net_acres == 0:
-            acquisition_cost = 0.0
-        else:
-            acquisition_cost = (
-                float(slot["net_acres"]) / total_net_acres
-            ) * acquisition_cost_override
-    else:
-        acquisition_cost = float(slot["net_acres"]) * bid_price_final
-
-    slot["bid_price_final"] = bid_price_final
-    slot["unit_acres_final"] = unit_acres_final
-    slot["working_interest"] = working_interest
-    slot["net_wells_calc"] = net_wells
-    slot["acquisition_cost"] = acquisition_cost
-
-    return slot
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-# -----------------------------
-# Single well economics
-# -----------------------------
-def run_single_slot_economics(slot, type_curve_library, global_assumptions, slot_ngl):
-    tc_name = clean_tc_name(slot["tc_name"])
-    lateral_length = float(slot["lateral_length"])
-    spud_date = pd.to_datetime(slot["drilling_spud_month"])
-    flowback_delay = int(slot["flowback_delay"])
-    ngl_yield = float(slot["ngl_yield"])
-    nri = float(slot["net_revenue_interest"])
-    tc_risk = float(slot["tc_risk"])
-
-
-    use_sev_tax_pct = bool(
-        global_assumptions.get("use_sev_tax_pct", False)
+def build_sensitivity_signature(
+    base_signature,
+    sensitivity_key,
+    x_values,
+    x_variable,
+    y_values,
+    y_variable,
+):
+    payload = {
+        "base_signature": base_signature,
+        "sensitivity_key": sensitivity_key,
+        "x_values": list(x_values),
+        "x_variable": x_variable,
+        "y_values": list(y_values),
+        "y_variable": y_variable,
+    }
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_signature_json_default,
     )
-    
-    oil_sev_tax = float(global_assumptions["oil_sev_tax"])
-    gas_sev_tax = float(global_assumptions["gas_sev_tax"])
-    ad_val_tax = float(global_assumptions["ad_val_tax"])
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
-    oil_diff = float(slot["oil_diff"])
-    gas_diff = float(slot["gas_diff"])
 
-    oil_opex_bbl = float(slot["oil_opex_bbl"])
-    gas_opex_mcf = float(slot["gas_opex_mcf"])
-    ngl_opex = float(slot["ngl_opex"])
-    fixed_loe = float(slot["fixed_loe"])
-    dc_costs = float(slot["dc_costs"])
+def resize_slot_df(existing_df, target_slots):
+    existing_df = existing_df.copy().reset_index(drop=True)
+    current_slots = len(existing_df)
 
-    tc_info = type_curve_library[tc_name]
-    base_lateral = float(tc_info["base_lateral"])
-    
-    tc_df = (
-        tc_info["monthly"]
-        .copy()
-        .sort_values("month")
+    if current_slots == target_slots:
+        existing_df["slot_id"] = range(1, target_slots + 1)
+        return existing_df
+
+    if current_slots < target_slots:
+        new_rows = build_slot_template(target_slots).iloc[current_slots:].copy()
+        existing_df = pd.concat([existing_df, new_rows], ignore_index=True)
+        existing_df["slot_id"] = range(1, target_slots + 1)
+        return existing_df
+
+    trimmed_df = existing_df.iloc[:target_slots].copy().reset_index(drop=True)
+    trimmed_df["slot_id"] = range(1, target_slots + 1)
+    return trimmed_df
+
+
+def build_dale_group_audit(slot_df):
+    required_cols = {
+        "dale_promote",
+        "dale_payout_group",
+        "date",
+        "promote_monthly_investment",
+        "promote_monthly_distributions",
+        "promote_cumulative_investment",
+        "promote_cumulative_distributions",
+        "promote_running_multiple",
+        "promote_hurdle_reached",
+        "promote_active",
+        "promote_hurdle_date",
+        "promote_effective_date",
+    }
+    if not required_cols.issubset(slot_df.columns):
+        return pd.DataFrame()
+
+    cols = [
+        "dale_payout_group",
+        "date",
+        "promote_monthly_investment",
+        "promote_monthly_distributions",
+        "promote_cumulative_investment",
+        "promote_cumulative_distributions",
+        "promote_running_multiple",
+        "promote_hurdle_reached",
+        "promote_active",
+        "promote_hurdle_date",
+        "promote_effective_date",
+    ]
+    return (
+        slot_df.loc[slot_df["dale_promote"].fillna(False), cols]
+        .drop_duplicates(["dale_payout_group", "date"])
+        .sort_values(["dale_payout_group", "date"])
         .reset_index(drop=True)
     )
-    
-    tc_df["period"] = pd.to_numeric(
-        tc_df["month"],
-        errors="raise",
-    ).astype(int)
-    
-    spud_month = (
-        pd.Timestamp(spud_date)
-        .to_period("M")
-        .to_timestamp()
-    )
-    
-    production_start_month = (
-        spud_month
-        + pd.DateOffset(months=flowback_delay)
-    )
-    
-    tc_df["date"] = [
-        production_start_month
-        + pd.DateOffset(months=int(period) - 1)
-        for period in tc_df["period"]
-    ]
-    
-    index_pricing = build_index_price_series(
-        dates=tc_df["date"],
-        global_assumptions=global_assumptions,
-    )
-    
-    tc_df["index_oil_price"] = (
-        index_pricing["index_oil_price"].to_numpy()
-    )
-    
-    tc_df["index_gas_price"] = (
-        index_pricing["index_gas_price"].to_numpy()
-    )
-    
-    ll_scale = lateral_length / base_lateral
 
-    tc_df["base_oil_scaled"] = tc_df["oil"] * tc_risk * ll_scale
-    tc_df["base_gas_scaled"] = tc_df["gas"] * tc_risk * ll_scale
 
-    tc_df["gross_oil_production"] = tc_df["base_oil_scaled"]
-    tc_df["gross_gas_production"] = tc_df["base_gas_scaled"] * (
-        1.0 - float(slot_ngl["shrink"])
-    )
-    tc_df["gross_ngl_production"] = tc_df["base_gas_scaled"] * ngl_yield / 42.0
+def to_excel_bytes(deal_df, slot_df):
+    output = BytesIO()
+    dale_group_df = build_dale_group_audit(slot_df)
 
-    tc_df["monthly_production_boe"] = (
-        tc_df["gross_oil_production"]
-        + tc_df["gross_ngl_production"]
-        + (tc_df["gross_gas_production"] / 6.0)
-    )
-
-    tc_df["oil_royalty_volumes"] = tc_df["gross_oil_production"] * (1.0 - nri)
-    tc_df["gas_royalty_volumes"] = tc_df["gross_gas_production"] * (1.0 - nri)
-    tc_df["ngl_royalty_volumes"] = tc_df["gross_ngl_production"] * (1.0 - nri)
-
-    tc_df["equity_oil_production"] = (
-        tc_df["gross_oil_production"] - tc_df["oil_royalty_volumes"]
-    )
-    tc_df["equity_gas_production"] = (
-        tc_df["gross_gas_production"] - tc_df["gas_royalty_volumes"]
-    )
-    tc_df["equity_ngl_production"] = (
-        tc_df["gross_ngl_production"] - tc_df["ngl_royalty_volumes"]
-    )
-
-    tc_df["local_oil_price"] = (
-        tc_df["index_oil_price"]
-        + oil_diff
-    )
-    
-    tc_df["local_gas_price"] = (
-        tc_df["index_gas_price"]
-        + gas_diff
-    )
-    
-    tc_df["local_ngl_price"] = (
-        tc_df["index_oil_price"]
-        * float(slot_ngl["ngl_pct_of_wti"])
-    )
-
-    tc_df["oil_revenue"] = tc_df["local_oil_price"] * tc_df["equity_oil_production"]
-    tc_df["gas_revenue"] = tc_df["local_gas_price"] * tc_df["equity_gas_production"]
-    tc_df["ngl_revenue"] = tc_df["local_ngl_price"] * tc_df["equity_ngl_production"]
-    tc_df["total_revenue"] = (
-        tc_df["oil_revenue"] + tc_df["gas_revenue"] + tc_df["ngl_revenue"]
-    )
-
-    variable_loe = -(
-        tc_df["gross_oil_production"] * oil_opex_bbl
-        + tc_df["gross_gas_production"] * gas_opex_mcf
-        + tc_df["gross_ngl_production"] * ngl_opex
-    )
-    fixed_loe_monthly = -fixed_loe
-
-    tc_df["variable_loe"] = variable_loe
-    tc_df["fixed_loe_monthly"] = fixed_loe_monthly
-    tc_df["total_loe"] = tc_df["variable_loe"] + tc_df["fixed_loe_monthly"]
-
-    tc_df["ad_valorem_tax"] = -(
-        ad_val_tax * tc_df["total_revenue"]
-    )
-    
-    if use_sev_tax_pct:
-        # Net product revenue equals net production multiplied
-        # by the realized product price.
-        tc_df["oil_severance_tax"] = -(
-            oil_sev_tax * tc_df["oil_revenue"]
-        )
-    
-        tc_df["gas_severance_tax"] = -(
-            gas_sev_tax * tc_df["gas_revenue"]
-        )
-    
-    else:
-        # Preserve the existing fixed-rate methodology.
-        tc_df["oil_severance_tax"] = -(
-            oil_sev_tax * tc_df["equity_oil_production"]
-        )
-    
-        tc_df["gas_severance_tax"] = -(
-            gas_sev_tax
-            * (
-                tc_df["equity_gas_production"]
-                / (1.0 - float(slot_ngl["shrink"]))
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        deal_df.to_excel(writer, index=False, sheet_name="Deal Audit")
+        slot_df.to_excel(writer, index=False, sheet_name="Slot Audit")
+        if not dale_group_df.empty:
+            dale_group_df.to_excel(
+                writer,
+                index=False,
+                sheet_name="Dale Group Audit",
             )
-        )
 
-    tc_df["tax"] = (
-        tc_df["ad_valorem_tax"]
-        + tc_df["oil_severance_tax"]
-        + tc_df["gas_severance_tax"]
+    output.seek(0)
+    return output.getvalue()
+
+def build_deal_log_csv(opportunity_name, overview_df, model_slot_df):
+    # This will be the very first section in the exported CSV.
+    deal_name_df = pd.DataFrame(
+        [{"Deal Name": str(opportunity_name).strip()}]
     )
 
-    tc_df["net_revenue"] = tc_df["total_revenue"]
-    tc_df["opex"] = tc_df["variable_loe"]
-
-    period_0_pricing = build_index_price_series(
-        dates=[spud_month],
-        global_assumptions=global_assumptions,
-    ).iloc[0]
-    
-    period_0_oil_index = float(
-        period_0_pricing["index_oil_price"]
-    )
-    
-    period_0_gas_index = float(
-        period_0_pricing["index_gas_price"]
-    )
-    
-    period_0 = pd.DataFrame(
-        {
-            "period": [0],
-            "date": [spud_month],
-            "index_oil_price": [period_0_oil_index],
-            "index_gas_price": [period_0_gas_index],
-            "base_oil_scaled": [0.0],
-            "base_gas_scaled": [0.0],
-            "gross_oil_production": [0.0],
-            "gross_gas_production": [0.0],
-            "gross_ngl_production": [0.0],
-            "monthly_production_boe": [0.0],
-            "oil_royalty_volumes": [0.0],
-            "gas_royalty_volumes": [0.0],
-            "ngl_royalty_volumes": [0.0],
-            "equity_oil_production": [0.0],
-            "equity_gas_production": [0.0],
-            "equity_ngl_production": [0.0],
-            "local_oil_price": [
-                period_0_oil_index + oil_diff
-            ],
-            "local_gas_price": [
-                period_0_gas_index + gas_diff
-            ],
-            "local_ngl_price": [
-                period_0_oil_index
-                * float(slot_ngl["ngl_pct_of_wti"])
-            ],
-            "oil_revenue": [0.0],
-            "gas_revenue": [0.0],
-            "ngl_revenue": [0.0],
-            "total_revenue": [0.0],
-            "net_revenue": [0.0],
-            "opex": [0.0],
-            "variable_loe": [0.0],
-            "fixed_loe_monthly": [0.0],
-            "total_loe": [0.0],
-            "tax": [0.0],
-        }
-    )
-    
-    df = pd.concat(
-        [
-            period_0,
-            tc_df[
-                [
-                    "date",
-                    "index_oil_price",
-                    "index_gas_price",
-                    "period",
-                    "base_oil_scaled",
-                    "base_gas_scaled",
-                    "gross_oil_production",
-                    "gross_gas_production",
-                    "gross_ngl_production",
-                    "monthly_production_boe",
-                    "oil_royalty_volumes",
-                    "gas_royalty_volumes",
-                    "ngl_royalty_volumes",
-                    "equity_oil_production",
-                    "equity_gas_production",
-                    "equity_ngl_production",
-                    "local_oil_price",
-                    "local_gas_price",
-                    "local_ngl_price",
-                    "oil_revenue",
-                    "gas_revenue",
-                    "ngl_revenue",
-                    "total_revenue",
-                    "net_revenue",
-                    "opex",
-                    "variable_loe",
-                    "fixed_loe_monthly",
-                    "total_loe",
-                    "tax",
-                ]
-            ],
-        ],
-        ignore_index=True,
-    )
-    df = df.sort_values("period").reset_index(drop=True)
-
-    df["capex"] = 0.0
-    df.loc[df["period"] == 0, "capex"] = -(dc_costs * lateral_length)
-
-    # Determine the economic limit using the unmodified operating cash flow.
-    # Once a producing well has a negative operating month, it is permanently
-    # shut in beginning in that month. This prevents late-life fixed LOE from
-    # creating a second cash-flow sign change and unstable/multiple XIRRs.
-    df["pre_shut_in_operating_cf"] = (
-        df["net_revenue"] + df["total_loe"] + df["tax"]
+    return (
+        deal_name_df.to_csv(index=False)
+        + "\nDEAL RUN OVERVIEW\n"
+        + overview_df.to_csv(index=False)
+        + "\nTC INPUTS USED FOR MODEL RUN\n"
+        + model_slot_df.to_csv(index=False)
     )
 
-    df["economic_limit_reached"] = (
-        df["period"].gt(0)
-        & df["pre_shut_in_operating_cf"].lt(0.0)
+def apply_calc_unit_acres(df):
+    df = df.copy()
+    mask = df["use_calc_unit_acres"].fillna(False)
+
+    df.loc[mask, "unit_acres"] = (
+        df.loc[mask, "lateral_length"] / 50.0 * df.loc[mask, "gross_wells"]
     )
-    df["well_shut_in"] = df["economic_limit_reached"].cummax()
-
-    shut_in_cols = [
-        "base_oil_scaled",
-        "base_gas_scaled",
-        "gross_oil_production",
-        "gross_gas_production",
-        "gross_ngl_production",
-        "monthly_production_boe",
-        "oil_royalty_volumes",
-        "gas_royalty_volumes",
-        "ngl_royalty_volumes",
-        "equity_oil_production",
-        "equity_gas_production",
-        "equity_ngl_production",
-        "oil_revenue",
-        "gas_revenue",
-        "ngl_revenue",
-        "total_revenue",
-        "net_revenue",
-        "opex",
-        "variable_loe",
-        "fixed_loe_monthly",
-        "total_loe",
-        "tax",
-    ]
-    existing_shut_in_cols = [c for c in shut_in_cols if c in df.columns]
-    df.loc[df["well_shut_in"], existing_shut_in_cols] = 0.0
-
-    # Recalculate the final operating cash flow after applying the permanent
-    # shut-in. Keep operating_cf_shut_in for backward-compatible outputs.
-    df["operating_cf"] = df["net_revenue"] + df["total_loe"] + df["tax"]
-    df["operating_cf_shut_in"] = df["operating_cf"]
-    df["cash_flow"] = df["operating_cf"] + df["capex"]
 
     return df
 
 
-# -----------------------------
-# Slot financials
-# -----------------------------
-
-def build_slot_financials(
-    slot, deal_settings, type_curve_library, global_assumptions, total_net_acres
+def build_sensitivity_range(
+    base_value,
+    step,
+    steps_each_way=3,
+    min_value=None,
 ):
-    slot = calc_slot_metrics(slot, deal_settings, total_net_acres)
+    """Build a centered sensitivity range while respecting an optional floor.
+
+    If the lower values hit the floor, duplicate values are removed and the
+    upper end is extended so the table keeps the requested number of points.
+    The base value remains in the range.
+    """
+    target_count = (steps_each_way * 2) + 1
+    raw_values = [
+        float(base_value) + float(step) * i
+        for i in range(-steps_each_way, steps_each_way + 1)
+    ]
+
+    if min_value is not None:
+        raw_values = [max(float(min_value), value) for value in raw_values]
+
+    values = []
+    for value in raw_values:
+        rounded = round(float(value), 10)
+        if rounded not in values:
+            values.append(rounded)
+
+    while len(values) < target_count:
+        next_value = max(values) + float(step)
+        values.append(round(next_value, 10))
+
+    return sorted(values)
+
+def build_percentage_sensitivity_range(
+    base_value,
+    pct_step=0.05,
+    steps_each_way=4,
+    min_value=0.0,
+):
+    """Build a sensitivity range using percentage changes from the base.
+
+    Example: a 5% step with four steps each way produces 80% through
+    120% of the base value. Values are rounded to two decimals.
+    """
+    base_value = float(base_value)
+    values = [
+        max(
+            float(min_value),
+            base_value * (1.0 + float(pct_step) * i),
+        )
+        for i in range(-steps_each_way, steps_each_way + 1)
+    ]
+    return [round(value, 2) for value in values]
+
+
+def weighted_avg_by_net_acres(slot_df, value_col, weight_col="net_acres"):
+    """Return a net-acre weighted average for a slot-level input."""
+    values = pd.to_numeric(slot_df[value_col], errors="coerce")
+    weights = pd.to_numeric(slot_df[weight_col], errors="coerce").fillna(0.0)
+
+    valid = values.notna() & weights.gt(0)
+
+    if not valid.any():
+        return float(values.mean()) if values.notna().any() else 0.0
+
+    return float((values[valid] * weights[valid]).sum() / weights[valid].sum())
+
+
+def weighted_avg_spud_month_by_net_acres(
+    slot_df,
+    date_col="drilling_spud_month",
+    weight_col="net_acres",
+):
+    """Return a net-acre-weighted representative spud month.
+
+    The sensitivity shifts every slot by the same month delta, so relative
+    timing between slots is preserved. This weighted month is used only for
+    the displayed center date and axis labels.
+    """
+    dates = pd.to_datetime(slot_df[date_col], errors="coerce")
+    weights = pd.to_numeric(slot_df[weight_col], errors="coerce").fillna(0.0)
+
+    valid = dates.notna() & weights.gt(0)
+    if not valid.any():
+        valid_dates = dates.dropna()
+        if valid_dates.empty:
+            return pd.Timestamp(next_month_start())
+        return valid_dates.iloc[0].to_period("M").to_timestamp()
+
+    month_numbers = (
+        dates[valid].dt.year.astype(float) * 12.0
+        + dates[valid].dt.month.astype(float)
+        - 1.0
+    )
+    weighted_month_number = int(
+        round((month_numbers * weights[valid]).sum() / weights[valid].sum())
+    )
+
+    year, month_index = divmod(weighted_month_number, 12)
+    return pd.Timestamp(year=year, month=month_index + 1, day=1)
+
+
+@st.cache_data(show_spinner=False)
+def run_two_way_sensitivity(
+    slot_df,
+    deal_inputs,
+    x_values,
+    x_variable,
+    y_values,
+    y_variable,
+):
+    """Run a generic two-variable IRR and MOIC sensitivity table."""
+    irr_table = pd.DataFrame(index=y_values, columns=x_values, dtype=float)
+    moic_table = pd.DataFrame(index=y_values, columns=x_values, dtype=float)
+
+    base_tc_risk = weighted_avg_by_net_acres(slot_df, "tc_risk")
+    base_ngl_yield = weighted_avg_by_net_acres(slot_df, "ngl_yield")
+    base_spud_month = weighted_avg_spud_month_by_net_acres(slot_df)
+    
+    base_dc_override_enabled = bool(
+        deal_inputs.get("use_dc_override", False)
+    )
+    
+    base_dc = (
+        float(deal_inputs.get("dc_override", 0.0))
+        if base_dc_override_enabled
+        else weighted_avg_by_net_acres(slot_df, "dc_costs")
+    )
+
+    def apply_value(sens_slot_df, sens_deal_inputs, variable, value):
+        if variable == "spud_date":
+            target_spud_month = pd.Timestamp(value).to_period("M").to_timestamp()
+            month_delta = (
+                (target_spud_month.year - base_spud_month.year) * 12
+                + target_spud_month.month
+                - base_spud_month.month
+            )
+            sens_slot_df["drilling_spud_month"] = (
+                pd.to_datetime(
+                    sens_slot_df["drilling_spud_month"],
+                    errors="coerce",
+                )
+                + pd.DateOffset(months=int(month_delta))
+            )
+            return
+
+        value = float(value)
+
+        if variable == "bid":
+            sens_deal_inputs["use_bid_override"] = True
+            sens_deal_inputs["bid_override"] = max(1.0, value)
+
+        elif variable == "dc":
+            dc_delta = value - float(base_dc)
+        
+            if base_dc_override_enabled:
+                # A deal-level D&C override was selected in the base case,
+                # so move that uniform override up or down.
+                sens_deal_inputs["use_dc_override"] = True
+                sens_deal_inputs["dc_override"] = max(
+                    0.0,
+                    float(base_dc) + dc_delta,
+                )
+        
+            else:
+                # Preserve each slot's original D&C relationship and add
+                # the same sensitivity change to every slot.
+                sens_deal_inputs["use_dc_override"] = False
+        
+                sens_slot_df["dc_costs"] = (
+                    pd.to_numeric(
+                        sens_slot_df["dc_costs"],
+                        errors="coerce",
+                    )
+                    .fillna(0.0)
+                    + dc_delta
+                ).clip(lower=0.0)
+
+        elif variable == "oil":
+            sens_deal_inputs["oil_price"] = value
+
+        elif variable == "gas":
+            sens_deal_inputs["gas_price"] = value
+
+        elif variable == "tc_risk":
+            tc_risk_delta = value - float(base_tc_risk)
+            sens_slot_df["tc_risk"] = (
+                pd.to_numeric(
+                    sens_slot_df["tc_risk"],
+                    errors="coerce",
+                ).fillna(0.0)
+                + tc_risk_delta
+            ).clip(lower=0.0)
+
+        elif variable == "ngl_yield":
+            ngl_delta = value - float(base_ngl_yield)
+            sens_slot_df["ngl_yield"] = (
+                pd.to_numeric(
+                    sens_slot_df["ngl_yield"],
+                    errors="coerce",
+                ).fillna(0.0)
+                + ngl_delta
+            ).clip(lower=0.0)
+
+        elif variable == "carry":
+            # Sensitivity values are stored as decimals for percent axis
+            # formatting (0.10 = 10%). The model's deal-level override accepts
+            # a whole percent, matching the slot editor input convention.
+            sens_deal_inputs["use_carry_override"] = True
+            sens_deal_inputs["carry_override_pct"] = max(
+                0.0,
+                min(100.0, value * 100.0),
+            )
+
+        else:
+            raise ValueError(f"Unsupported sensitivity variable: {variable}")
+
+    for y_value in y_values:
+        for x_value in x_values:
+            sens_deal_inputs = deal_inputs.copy()
+            sens_slot_df = slot_df.copy()
+
+            apply_value(
+                sens_slot_df,
+                sens_deal_inputs,
+                x_variable,
+                x_value,
+            )
+            apply_value(
+                sens_slot_df,
+                sens_deal_inputs,
+                y_variable,
+                y_value,
+            )
+
+            try:
+                irr, moic = run_deal_metrics(
+                    sens_slot_df,
+                    sens_deal_inputs,
+                )
+                irr_table.loc[y_value, x_value] = irr
+                moic_table.loc[y_value, x_value] = moic
+            except Exception:
+                irr_table.loc[y_value, x_value] = None
+                moic_table.loc[y_value, x_value] = None
+
+    return irr_table, moic_table
+
+@st.cache_data(show_spinner=False)
+def run_individual_slot_returns(slot_df, deal_inputs):
+    slot_returns = {}
+
+    total_net_acres = float(slot_df["net_acres"].sum())
+
+    for _, slot_row in slot_df.iterrows():
+        slot_id = int(slot_row["slot_id"])
+
+        one_slot_df = pd.DataFrame([slot_row]).copy()
+        one_slot_df = one_slot_df.drop(columns=["include_slot"], errors="ignore")
+
+        slot_deal_inputs = deal_inputs.copy()
+
+        # If using a deal-level acquisition override, allocate it across slots
+        # based on each slot's share of total net acres.
+        if slot_deal_inputs.get("use_acquisition_override", False):
+            total_override = float(slot_deal_inputs.get("acquisition_cost_override", 0.0))
+            slot_net_acres = float(slot_row.get("net_acres", 0.0))
+
+            allocated_override = (
+                total_override * slot_net_acres / total_net_acres
+                if total_net_acres > 0
+                else 0.0
+            )
+
+            slot_deal_inputs["acquisition_cost_override"] = allocated_override
+
+        try:
+            slot_irr, slot_moic = run_deal_metrics(
+                one_slot_df,
+                slot_deal_inputs,
+            )
+
+            slot_returns[slot_id] = {
+                "irr": slot_irr,
+                "moic": slot_moic,
+            }
+
+        except Exception:
+            slot_returns[slot_id] = {
+                "irr": None,
+                "moic": None,
+            }
+
+    return slot_returns
+
+def build_heatmap(
+    df,
+    title,
+    metric="irr",
+    x_title="",
+    y_title="",
+    x_format="dollar",
+    y_format="dollar",
+    base_x=None,
+    base_y=None,
+):
+    heatmap_df = df.copy()
+
+    def format_axis_value(v, fmt):
+        if fmt == "dollar":
+            return f"${int(v):,}" if float(v).is_integer() else f"${v:,.2f}"
+        if fmt == "percent":
+            return f"{v:.0%}"
+        if fmt == "float2":
+            return f"{v:.2f}"
+        if fmt == "date":
+            return pd.Timestamp(v).strftime("%b-%y")
+        return str(v)
+
+    x_vals = [format_axis_value(x, x_format) for x in heatmap_df.columns]
+    y_vals = [format_axis_value(y, y_format) for y in heatmap_df.index]
+
+    def clamp01(x):
+        return max(0.0, min(1.0, x))
+
+    if metric == "irr":
+        text_vals = heatmap_df.map(lambda x: f"{x:.2%}" if pd.notnull(x) else "")
+        zmin = 0.0
+        zmax = max(0.40, float(heatmap_df.max().max()))
+
+        low_cut = 0.15
+        high_cut = 0.25
+
+        low_norm = clamp01((low_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.33
+        high_norm = clamp01((high_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.66
+
+        colorscale = [
+            [0.00, "rgb(255,180,180)"],
+            [low_norm, "rgb(255,180,180)"],
+            [low_norm, "rgb(255,255,204)"],
+            [high_norm, "rgb(255,255,204)"],
+            [high_norm, "rgb(214,232,202)"],
+            [1.00, "rgb(214,232,202)"],
+        ]
+    elif metric == "moic":
+        text_vals = heatmap_df.map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "")
+        zmin = min(0.0, float(heatmap_df.min().min()))
+        zmax = max(2.0, float(heatmap_df.max().max()))
+
+        low_cut = 1.00
+        high_cut = 1.50
+
+        low_norm = clamp01((low_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.33
+        high_norm = clamp01((high_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.66
+
+        colorscale = [
+            [0.00, "rgb(255,180,180)"],
+            [low_norm, "rgb(255,180,180)"],
+            [low_norm, "rgb(255,255,204)"],
+            [high_norm, "rgb(255,255,204)"],
+            [high_norm, "rgb(214,232,202)"],
+            [1.00, "rgb(214,232,202)"],
+        ]
+    else:
+        text_vals = heatmap_df.map(lambda x: f"{x}" if pd.notnull(x) else "")
+        zmin = 0.0
+        zmax = 1.0
+        colorscale = "RdYlGn"
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=heatmap_df.values,
+            x=x_vals,
+            y=y_vals,
+            text=text_vals.values,
+            texttemplate="%{text}",
+            colorscale=colorscale,
+            zmin=zmin,
+            zmax=zmax,
+            showscale=False,
+            hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y}}<br>Value: %{{text}}<extra></extra>",
+            textfont=dict(size=16),
+        )
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.0,
+            xanchor="left",
+            y=0.98,
+            yanchor="top",
+            font=dict(size=22, color="black"),
+        ),
+        font=dict(size=16, color="black"),
+        xaxis=dict(
+            title=dict(text=x_title, font=dict(size=18, color="black")),
+            tickfont=dict(size=15, color="black"),
+            side="top",
+            type="category",
+            automargin=True,
+        ),
+        yaxis=dict(
+            title=dict(
+                text=y_title,
+                font=dict(size=18, color="black"),   # 🔥 slightly bigger
+                standoff=20,                         # 🔥 THIS creates gap
+            ),
+            tickfont=dict(size=15, color="black"),   # 🔥 slightly bigger
+            type="category",
+            automargin=True,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(l=90, r=20, t=90, b=60),
+        height=390,
+    )
+    
+    if base_x is not None and base_y is not None:
+        try:
+            x_vals_raw = list(heatmap_df.columns)
+            y_vals_raw = list(heatmap_df.index)
+
+            def find_closest_index(values, target):
+                def distance(value):
+                    if isinstance(value, (pd.Timestamp, date)) or isinstance(
+                        target,
+                        (pd.Timestamp, date),
+                    ):
+                        return abs(
+                            (pd.Timestamp(value) - pd.Timestamp(target)).days
+                        )
+                    return abs(float(value) - float(target))
+
+                return min(range(len(values)), key=lambda i: distance(values[i]))
+
+            x_idx = find_closest_index(x_vals_raw, base_x)
+            y_idx = find_closest_index(y_vals_raw, base_y)
+
+            fig.add_shape(
+                type="rect",
+                x0=x_idx - 0.5,
+                x1=x_idx + 0.5,
+                y0=y_idx - 0.5,
+                y1=y_idx + 0.5,
+                line=dict(color="black", width=3),
+                fillcolor="rgba(0,0,0,0)",
+            )
+        except Exception:
+            pass
+
+    return fig
+
+
+def build_quarterly_output_table(deal_df, all_slots_df, slot_df, deal_inputs):
+    import numpy as np
+
+    deal = deal_df.copy()
+    slots = all_slots_df.copy()
+    slot_inputs = slot_df.copy()
+
+    deal["date"] = pd.to_datetime(deal["date"])
+    slots["date"] = pd.to_datetime(slots["date"])
+    slot_inputs["drilling_spud_month"] = pd.to_datetime(slot_inputs["drilling_spud_month"])
+
+    deal["quarter_label"] = "Q" + deal["date"].dt.quarter.astype(str) + " " + deal["date"].dt.strftime("%y")
+    deal["year_label"] = deal["date"].dt.year.astype(str)
+
+    quarter_order = [
+        "Q1 26", "Q2 26", "Q3 26", "Q4 26",
+        "Q1 27", "Q2 27", "Q3 27", "Q4 27",
+    ]
+    year_order = [str(y) for y in range(2026, 2034)]
+
+    def quarter_days_from_label(q_label):
+        q_num = int(q_label[1])
+        year = 2000 + int(q_label[-2:])
+        quarter_start_month = {1: 1, 2: 4, 3: 7, 4: 10}[q_num]
+        start = pd.Timestamp(year=year, month=quarter_start_month, day=1)
+        end = start + pd.offsets.QuarterEnd(0)
+        return (end - start).days + 1
+
+    def year_days_from_label(y_label):
+        year = int(y_label)
+        start = pd.Timestamp(year=year, month=1, day=1)
+        end = pd.Timestamp(year=year, month=12, day=31)
+        return (end - start).days + 1
+
+    q_prices = (
+    deal.groupby("quarter_label")[
+        [
+            "index_oil_price",
+            "index_gas_price",
+        ]
+    ]
+    .mean()
+    .reindex(quarter_order)
+    )
+    
+    y_prices = (
+        deal.groupby("year_label")[
+            [
+                "index_oil_price",
+                "index_gas_price",
+            ]
+        ]
+        .mean()
+        .reindex(year_order)
+    )
+    
+    q_days = pd.Series({q: quarter_days_from_label(q) for q in quarter_order}, index=quarter_order, dtype=float)
+    y_days = pd.Series({y: year_days_from_label(y) for y in year_order}, index=year_order, dtype=float)
+
+    q = deal.groupby("quarter_label").sum(numeric_only=True).reindex(quarter_order)
+    y = deal.groupby("year_label").sum(numeric_only=True).reindex(year_order)
+
+    slot_metrics = slot_inputs.copy()
+    slot_metrics["spud_quarter"] = "Q" + slot_metrics["drilling_spud_month"].dt.quarter.astype(str) + " " + slot_metrics["drilling_spud_month"].dt.strftime("%y")
+    slot_metrics["spud_year"] = slot_metrics["drilling_spud_month"].dt.year.astype(str)
+
+    # Gross wells do not change with a WI promote. Net wells spud should use
+    # the actual effective ownership on each slot's spud date, so wells drilled
+    # after the promote vests reflect the reduced WI.
+    slot_metrics["gross_wells_spud"] = slot_metrics["gross_wells"]
+
+    spud_effective_wi = (
+        slots[["slot_id", "date", "effective_net_wells"]]
+        .merge(
+            slot_inputs[["slot_id", "drilling_spud_month"]],
+            on="slot_id",
+            how="inner",
+        )
+    )
+    spud_effective_wi = spud_effective_wi[
+        spud_effective_wi["date"] == spud_effective_wi["drilling_spud_month"]
+    ]
+    net_wells_by_slot = (
+        spud_effective_wi.groupby("slot_id")["effective_net_wells"].first()
+    )
+
+    # Fallback for any unmatched row retains the original slot calculation.
+    unit_acres_final = np.where(
+        slot_metrics["use_calc_unit_acres"].fillna(False),
+        slot_metrics["gross_wells"] * slot_metrics["lateral_length"] / 50.0,
+        slot_metrics["unit_acres"],
+    )
+    fallback_working_interest = np.where(
+        unit_acres_final != 0,
+        (slot_metrics["net_acres"] / unit_acres_final) * slot_metrics["pct_unitized"],
+        0.0,
+    )
+    fallback_net_wells = fallback_working_interest * slot_metrics["gross_wells"]
+
+    slot_metrics["net_wells_spud"] = (
+        slot_metrics["slot_id"].map(net_wells_by_slot)
+        .fillna(pd.Series(fallback_net_wells, index=slot_metrics.index))
+    )
+
+    q_spud = slot_metrics.groupby("spud_quarter")[["gross_wells_spud", "net_wells_spud"]].sum().reindex(quarter_order).fillna(0.0)
+    y_spud = slot_metrics.groupby("spud_year")[["gross_wells_spud", "net_wells_spud"]].sum().reindex(year_order).fillna(0.0)
+
+    def safe_div(n, d):
+        return np.where((d != 0) & pd.notnull(d), n / d, 0.0)
+
+    def build_section(df, days, index_prices):
+        out = pd.DataFrame(index=[], columns=df.index)
+
+        oil_index_price = index_prices[
+            "index_oil_price"
+        ]
+        
+        gas_index_price = index_prices[
+            "index_gas_price"
+        ]
+
+        realized_oil = safe_div(df["slot_oil_revenue"], df["slot_net_oil_production"])
+        realized_gas = safe_div(df["slot_gas_revenue"], df["slot_net_gas_production"])
+        realized_ngl_price = safe_div(df["slot_ngl_revenue"], df["slot_net_ngl_production"])
+        realized_ngl_pct_wti = safe_div(
+            realized_ngl_price,
+            oil_index_price,
+        )
+
+        oil_mbbl_d = safe_div(df["slot_net_oil_production"], days)
+        ngl_mbbl_d = safe_div(df["slot_net_ngl_production"], days)
+        gas_mmcf_d = safe_div(df["slot_net_gas_production"], days)
+
+        total_mcfe = (
+            df["slot_net_oil_production"] * 6.0
+            + df["slot_net_ngl_production"] * 6.0
+            + df["slot_net_gas_production"]
+        )
+        total_mcfe_d = safe_div(total_mcfe, days)
+
+        taxes_pos = -df["slot_tax"]
+        loe_pos = -df["slot_loe"]
+        total_opex = taxes_pos + loe_pos
+        ebitda = df["slot_total_revenue"] - total_opex
+
+        d_and_c = -df["slot_capex"]
+        acquisition = -df["slot_asset_purchase"]
+        total_capex = d_and_c + acquisition
+
+        free_cash_flow = df["slot_total_cash_flow"]
+
+        out.loc[
+            "Assumed Index Pricing - Crude Oil"
+        ] = oil_index_price
+        
+        out.loc[
+            "Assumed Index Pricing - Natural Gas"
+        ] = gas_index_price
+        out.loc["Realized Pricing - Crude Oil"] = realized_oil
+        out.loc["Realized Pricing - NGL (% of WTI)"] = realized_ngl_pct_wti
+        out.loc["Realized Pricing - Natural Gas"] = realized_gas
+        out.loc["Production - Crude Oil"] = oil_mbbl_d
+        out.loc["Production - NGL's"] = ngl_mbbl_d
+        out.loc["Production - Natural Gas"] = gas_mmcf_d
+        out.loc["Production - Total (Mcfe/d)"] = total_mcfe_d
+        out.loc["Revenues - Crude Oil"] = df["slot_oil_revenue"] / 1000.0
+        out.loc["Revenues - NGL's"] = df["slot_ngl_revenue"] / 1000.0
+        out.loc["Revenues - Natural Gas"] = df["slot_gas_revenue"] / 1000.0
+        out.loc["Revenues - Total"] = df["slot_total_revenue"] / 1000.0
+        out.loc["Operating Expenses - Taxes"] = taxes_pos / 1000.0
+        out.loc["Operating Expenses - LOE"] = loe_pos / 1000.0
+        out.loc["Operating Expenses - Total Opex"] = total_opex / 1000.0
+        out.loc["Taxes / Mcfe"] = safe_div(taxes_pos, total_mcfe)
+        out.loc["LOE / Mcfe"] = safe_div(loe_pos, total_mcfe)
+        out.loc["EBITDA"] = ebitda / 1000.0
+        out.loc["Capital Expenditures - D&C"] = d_and_c / 1000.0
+        out.loc["Capital Expenditures - Acquisition"] = acquisition / 1000.0
+        out.loc["Capital Expenditures - Total"] = total_capex / 1000.0
+        out.loc["Free Cash Flow"] = free_cash_flow / 1000.0
+        out.loc["Cumulative FCF"] = (free_cash_flow / 1000.0).cumsum()
+
+        return out
+
+    q_out = build_section(
+        q,
+        q_days,
+        q_prices,
+    )
+    
+    y_out = build_section(
+        y,
+        y_days,
+        y_prices,
+    )
+
+    q_out.loc["Gross Wells Spud"] = q_spud["gross_wells_spud"]
+    q_out.loc["Net Wells Spud"] = q_spud["net_wells_spud"]
+    y_out.loc["Gross Wells Spud"] = y_spud["gross_wells_spud"]
+    y_out.loc["Net Wells Spud"] = y_spud["net_wells_spud"]
+
+    row_order = [
+        "Assumed Index Pricing - Crude Oil",
+        "Assumed Index Pricing - Natural Gas",
+        "Realized Pricing - Crude Oil",
+        "Realized Pricing - NGL (% of WTI)",
+        "Realized Pricing - Natural Gas",
+        "Gross Wells Spud",
+        "Net Wells Spud",
+        "Production - Crude Oil",
+        "Production - NGL's",
+        "Production - Natural Gas",
+        "Production - Total (Mcfe/d)",
+        "Revenues - Crude Oil",
+        "Revenues - NGL's",
+        "Revenues - Natural Gas",
+        "Revenues - Total",
+        "Operating Expenses - Taxes",
+        "Operating Expenses - LOE",
+        "Operating Expenses - Total Opex",
+        "Taxes / Mcfe",
+        "LOE / Mcfe",
+        "EBITDA",
+        "Capital Expenditures - D&C",
+        "Capital Expenditures - Acquisition",
+        "Capital Expenditures - Total",
+        "Free Cash Flow",
+        "Cumulative FCF",
+    ]
+
+    q_out = q_out.reindex(row_order)
+    y_out = y_out.reindex(row_order)
+
+    separator = pd.DataFrame(index=q_out.index, columns=[" "], data="")
+    final = pd.concat([q_out, separator, y_out], axis=1)
+    return final
+
+
+def build_quarterly_output_display_table(df):
+    first_col = "$ in Thousands"
+    data_cols = list(df.columns)
+
+    pct_rows = {"Realized Pricing - NGL (% of WTI)"}
+    dollar_per_unit_rows = {"Taxes / Mcfe", "LOE / Mcfe"}
+    price_rows = {
+        "Assumed Index Pricing - Crude Oil",
+        "Assumed Index Pricing - Natural Gas",
+        "Realized Pricing - Crude Oil",
+        "Realized Pricing - Natural Gas",
+    }
+    production_rows = {
+        "Production - Crude Oil",
+        "Production - NGL's",
+        "Production - Natural Gas",
+        "Production - Total (Mcfe/d)",
+        "Gross Wells Spud",
+        "Net Wells Spud",
+    }
+
+    def fmt_value(source_row, col):
+        val = df.loc[source_row, col]
+
+        if col == " ":
+            return ""
+        
+        if pd.isnull(val) or val == "":
+            if source_row in production_rows or source_row in pct_rows or source_row in dollar_per_unit_rows or source_row in price_rows:
+                return "-"
+            return "-"
+
+        if source_row in pct_rows:
+            return format_accounting_percent(val, decimals=0)
+        if source_row in dollar_per_unit_rows:
+            return format_accounting_number(val, decimals=2, prefix="$")
+        if source_row in price_rows:
+            return format_accounting_number(val, decimals=2, prefix="$")
+        if source_row in production_rows:
+            return format_accounting_production(val)
+        return format_accounting_number(val, decimals=1, prefix="$")
+
+    rows = []
+    row_styles = []
+
+    def add_section(label):
+        row = {first_col: label}
+        for c in data_cols:
+            row[c] = ""
+        rows.append(row)
+        row_styles.append("section")
+
+    def add_gap():
+        row = {first_col: ""}
+        for c in data_cols:
+            row[c] = ""
+        rows.append(row)
+        row_styles.append("gap")
+
+    def add_data(label, source_row, indent=False, style="normal"):
+        display_label = f"\u00A0\u00A0\u00A0\u00A0{label}" if indent else label
+        row = {first_col: display_label}
+        for c in data_cols:
+            row[c] = fmt_value(source_row, c)
+        rows.append(row)
+        row_styles.append(style)
+
+    add_section("Assumed Index Pricing")
+    add_data("Crude Oil", "Assumed Index Pricing - Crude Oil", indent=True)
+    add_data("Natural Gas", "Assumed Index Pricing - Natural Gas", indent=True)
+
+    add_gap()
+
+    add_section("Realized Pricing")
+    add_data("Crude Oil", "Realized Pricing - Crude Oil", indent=True)
+    add_data("Natural Gas", "Realized Pricing - Natural Gas", indent=True)
+    add_data("NGL (% of WTI)", "Realized Pricing - NGL (% of WTI)", indent=True)
+
+    add_gap()
+
+    add_data("Gross Wells Spud", "Gross Wells Spud")
+    add_data("Net Wells Spud", "Net Wells Spud")
+
+    add_gap()
+
+    add_section("Production")
+    add_data("Crude Oil", "Production - Crude Oil", indent=True)
+    add_data("Natural Gas", "Production - Natural Gas", indent=True)
+    add_data("NGL's", "Production - NGL's", indent=True)
+    add_data("Total (Mcfe/d)", "Production - Total (Mcfe/d)", style="bold")
+
+    add_gap()
+
+    add_section("Revenues")
+    add_data("Crude Oil", "Revenues - Crude Oil", indent=True)
+    add_data("Natural Gas", "Revenues - Natural Gas", indent=True)
+    add_data("NGL's", "Revenues - NGL's", indent=True)
+    add_data("Total", "Revenues - Total")
+
+    add_gap()
+
+    add_section("Operating Expenses")
+    add_data("Taxes", "Operating Expenses - Taxes", indent=True)
+    add_data("LOE", "Operating Expenses - LOE", indent=True)
+    add_data("Total", "Operating Expenses - Total Opex")
+
+    add_gap()
+
+    add_data("Taxes / Mcfe", "Taxes / Mcfe", style="italic")
+    add_data("LOE / Mcfe", "LOE / Mcfe", style="italic")
+
+    add_gap()
+
+    add_data("EBITDA", "EBITDA", style="bold")
+
+    add_gap()
+
+    add_section("Capital Expenditures")
+    add_data("D&C", "Capital Expenditures - D&C", indent=True)
+    add_data("Acquisition", "Capital Expenditures - Acquisition", indent=True)
+    add_data("Total", "Capital Expenditures - Total")
+
+    add_gap()
+
+    add_data("Free Cash Flow", "Free Cash Flow", style="bold")
+
+    add_gap()
+
+    add_data("Cumulative FCF", "Cumulative FCF", style="footer")
+
+    display_df = pd.DataFrame(rows)
+    return display_df, row_styles
+
+
+def style_quarterly_output_table(display_df, row_styles):
+    style_map = pd.Series(row_styles, index=display_df.index)
+
+    first_col = display_df.columns[0]
+    data_cols = list(display_df.columns[1:])
+
+    quarter_cols = [c for c in data_cols if str(c).startswith("Q")]
+    year_cols = [c for c in data_cols if str(c).isdigit()]
+    separator_cols = [c for c in data_cols if str(c).strip() == ""]
+
+    def row_style(row):
+        rtype = style_map.loc[row.name]
+        styles = [""] * len(row)
+
+        if rtype == "section":
+            styles = ["font-weight: 700; text-align: left;"] + [""] * (len(row) - 1)
+        elif rtype == "bold":
+            styles = ["font-weight: 700;"] * len(row)
+        elif rtype == "italic":
+            styles = ["font-style: italic;"] * len(row)
+        elif rtype == "footer":
+            styles = [f"background-color: {QUARTERLY_HEADER_COLOR}; color: white; font-weight: 700;"] * len(row)
+        elif rtype == "gap":
+            styles = [""] * len(row)
+
+        return styles
+
+    return (
+        display_df.style
+        .apply(row_style, axis=1)
+        .hide(axis="index")
+        .set_properties(subset=[first_col], **{
+            "text-align": "left",
+            "white-space": "pre",
+            "background-color": "white",
+        })
+        .set_properties(subset=quarter_cols, **{
+            "text-align": "right",
+            "background-color": "white",
+        })
+        .set_properties(subset=year_cols, **{
+            "text-align": "right",
+            "background-color": "white",
+        })
+        .set_properties(subset=separator_cols, **{
+            "background-color": QUARTERLY_HEADER_COLOR,
+            "width": "4px",
+            "min-width": "4px",
+            "max-width": "4px",
+            "padding": "0",
+            "border": "none",
+        })
+
+        .set_table_styles([
+            {
+                "selector": "table",
+                "props": [
+                    ("border-collapse", "collapse"),
+                    ("border-spacing", "0"),
+                    ("width", "100%"),
+                    ("table-layout", "fixed"),
+                    ("border", "none !important"),
+                ],
+            },
+            {
+                "selector": "tbody td",
+                "props": [
+                    ("padding", "4px 8px"),
+                    ("font-size", "12px"),
+                    ("border", "none !important"),
+                    ("outline", "none !important"),
+                    ("box-shadow", "none !important"),
+                ],
+            },
+            {
+                "selector": "tbody td",
+                "props": [
+                    ("border", "none"),
+                    ("padding", "4px 8px"),
+                    ("font-size", "12px"),
+                ],
+            },
+            {
+                "selector": "tbody td.col0",
+                "props": [
+                    ("text-align", "left"),
+                    ("white-space", "pre"),
+                    ("width", "220px"),
+                ],
+            },
+            {
+                "selector": "tbody td:not(.col0)",
+                "props": [
+                    ("text-align", "right"),
+                    ("width", "80px"),
+                ],
+            },
+            {
+                "selector": "tbody tr",
+                "props": [
+                    ("border", "none !important"),
+                ],
+            },
+            {
+                "selector": "tbody td",
+                "props": [
+                    ("background-clip", "padding-box"),
+                ],
+            },
+            {
+                "selector": "thead th",
+                "props": [
+                    ("background-color", QUARTERLY_HEADER_COLOR),
+                    ("color", "white"),
+                    ("font-weight", "700"),
+                    ("font-size", "12px"),
+                    ("padding", "4px 8px"),
+                    ("border", "none !important"),
+                    ("outline", "none !important"),
+                    ("box-shadow", "none !important"),
+                    ("text-align", "right"),
+                ],
+            },
+            {
+                "selector": "thead th.col0",
+                "props": [
+                    ("text-align", "left"),
+                ],
+            },
+            {
+                "selector": "tbody td",
+                "props": [
+                    ("border-top", "none !important"),
+                    ("border-bottom", "none !important"),
+                ],
+            },
+            {
+                "selector": f"tbody tr:nth-child({len(display_df)}) td",
+                "props": [
+                    ("background-color", QUARTERLY_HEADER_COLOR),
+                    ("color", "white"),
+                    ("font-weight", "700"),
+                ],
+            },
+        ], overwrite=False)
+    )
+
+def calc_slot_eur_metrics(slot_row, deal_inputs):
+    type_curve_library = load_type_curve_library("type_curve_library.xlsx")
+    deal_settings = prepare_deal_settings(deal_inputs)
+    global_assumptions = prepare_global_assumptions(deal_inputs)
+
+    slot_inputs_df = prepare_slot_inputs(pd.DataFrame([slot_row]), deal_inputs)
+    slot_prepped = slot_inputs_df.iloc[0].copy()
+
+    total_net_acres = float(slot_prepped.get("net_acres", 0.0))
+
+    slot_prepped = calc_slot_metrics(
+        slot_prepped,
+        deal_settings=deal_settings,
+        total_net_acres=total_net_acres,
+    )
 
     slot_ngl = build_slot_ngl_factors(
-        slot=slot,
+        slot=slot_prepped,
         global_assumptions=global_assumptions,
         content_percentages=global_assumptions["content_percentages"],
         recover_ethane_percentages=global_assumptions["recover_ethane_percentages"],
@@ -819,1251 +1580,3305 @@ def build_slot_financials(
     )
 
     one_well_df = run_single_slot_economics(
-        slot=slot,
+        slot=slot_prepped,
         type_curve_library=type_curve_library,
         global_assumptions=global_assumptions,
         slot_ngl=slot_ngl,
     ).copy()
 
-    required_cols = [
-        "index_oil_price",
-        "index_gas_price",
-        "gross_oil_production",
-        "gross_gas_production",
-        "gross_ngl_production",
-        "monthly_production_boe",
-        "equity_oil_production",
-        "equity_gas_production",
-        "equity_ngl_production",
-        "local_oil_price",
-        "local_gas_price",
-        "local_ngl_price",
-        "total_loe",
-        "tax",
-        "operating_cf",
-        "capex",
-    ]
-    missing_cols = [c for c in required_cols if c not in one_well_df.columns]
-    if missing_cols:
-        raise KeyError(f"Missing expected columns in one_well_df: {missing_cols}")
+    prod_df = one_well_df[one_well_df["period"].between(1, 360)].copy()
 
-    df = one_well_df.copy()
+    lateral_length = float(slot_prepped["lateral_length"])
+    if lateral_length == 0:
+        return None, None, float(slot_ngl["shrink"])
 
-    gross_wells = float(slot["gross_wells"])
-    base_working_interest = float(slot["working_interest"])
-    base_net_wells = float(slot["net_wells_calc"])
-    lease_nri = float(slot["net_revenue_interest"])
+    oil_eur_per_ft = prod_df["gross_oil_production"].sum() / lateral_length
+    gas_eur_per_ft = prod_df["gross_gas_production"].sum() / lateral_length
+    gas_shrink = float(slot_ngl["shrink"])
 
-    # USEDC funds D&C at the combined USEDC + Granite WI, then Granite's
-    # carried percentage is removed from USEDC's production ownership.
-    carry_enabled = bool(slot.get("carry_enabled", False))
-    carry_wi_reversion_pct = (
-        float(slot.get("carry_wi_reversion_pct", 0.0))
-        if carry_enabled
-        else 0.0
-    )
-    carry_wi_reversion_pct = float(
-        np.clip(carry_wi_reversion_pct, 0.0, 1.0)
-    )
-    post_carry_ownership_factor = 1.0 - carry_wi_reversion_pct
+    return oil_eur_per_ft, gas_eur_per_ft, gas_shrink
 
-    dale_promote = bool(slot.get("dale_promote", False))
-    dale_unit_id = str(slot.get("dale_unit_id", f"UNIT-{int(slot['slot_id'])}")).strip()
-    dale_payout_group = str(
-        slot.get("dale_payout_group", dale_unit_id)
-    ).strip()
-    dale_first_well_carry = bool(
-        slot.get("dale_first_well_carry", False)
-    )
+def build_tc_assumptions_output_display_table(slot_df, deal_inputs, slot_returns=None):
+    df = slot_df.copy()
 
-    # Model-basis assumption:
-    # base_working_interest is the ORIGINAL WI represented by the slot before
-    # either Dale's initial 1/16 interest or the USEDC-to-Granite carry split.
-    # Dale's initial interest is therefore taken directly from original WI.
-    dale_initial_interest_pct = float(
-        np.clip(
-            deal_settings.get("dale_initial_interest_pct", 0.0625),
-            0.0,
-            1.0,
+    if slot_returns is None:
+        slot_returns = {}
+
+    if df.empty:
+        return pd.DataFrame({"TC Assumptions": []}), []
+
+    df["drilling_spud_month"] = pd.to_datetime(df["drilling_spud_month"], errors="coerce")
+    display_cols = [f"Slot {int(s)}" for s in df["slot_id"]]
+
+    rows = []
+    row_styles = []
+
+    def add_section(label):
+        row = {"TC Assumptions": label}
+        for c in display_cols:
+            row[c] = ""
+        rows.append(row)
+        row_styles.append("section")
+
+    def add_gap():
+        row = {"TC Assumptions": ""}
+        for c in display_cols:
+            row[c] = ""
+        rows.append(row)
+        row_styles.append("gap")
+
+    def add_data(label, values, style="normal"):
+        row = {"TC Assumptions": label}
+        row.update(values)
+        rows.append(row)
+        row_styles.append(style)
+
+    slot_map = {}
+    for _, r in df.iterrows():
+        slot_name = f"Slot {int(r['slot_id'])}"
+        slot_map[slot_name] = r
+
+    def fmt_num(x, decimals=1, prefix="", suffix=""):
+        return format_accounting_number(
+            x,
+            decimals=decimals,
+            prefix=prefix,
+            suffix=suffix,
+            null_as_blank=False,
         )
-    )
-    if dale_promote:
-        dale_initial_working_interest = (
-            base_working_interest * dale_initial_interest_pct
-        )
-    else:
-        dale_initial_working_interest = 0.0
 
-    gr_parties_working_interest = (
-        base_working_interest - dale_initial_working_interest
-    )
-    gr_parties_working_interest = max(
-        0.0,
-        gr_parties_working_interest,
-    )
-    gr_parties_net_wells = (
-        gr_parties_working_interest * gross_wells
-    )
+    def fmt_pct(x, decimals=0):
+        return format_accounting_percent(x, decimals=decimals, null_as_blank=False)
 
-    # A checked row represents the first well in that physical unit. Even when
-    # the slot contains several gross wells, only one well receives Dale's
-    # initial-interest D&C carry.
-    dale_first_well_carry_wells = (
-        min(1.0, max(0.0, gross_wells))
-        if dale_promote and dale_first_well_carry
-        else 0.0
-    )
-    dale_carry_dnc_net_wells = (
-        dale_initial_working_interest
-        * dale_first_well_carry_wells
-    )
-    funded_dnc_net_wells = (
-        gr_parties_net_wells + dale_carry_dnc_net_wells
-    )
+    def fmt_date(x):
+        if pd.isnull(x):
+            return "-"
+        return pd.to_datetime(x).strftime("%m/%d/%y")
 
-    df["slot_id"] = slot["slot_id"]
-    df["tc_name"] = slot["tc_name"]
-    df["dale_promote"] = dale_promote
-    df["dale_unit_id"] = dale_unit_id
-    df["dale_payout_group"] = dale_payout_group
-    df["dale_first_well_carry"] = dale_first_well_carry
-    df["dale_initial_interest_pct"] = dale_initial_interest_pct
-    df["pre_dale_working_interest"] = base_working_interest
-    df["dale_initial_working_interest"] = dale_initial_working_interest
-    df["post_initial_dale_working_interest"] = gr_parties_working_interest
-    df["gr_parties_working_interest"] = gr_parties_working_interest
-    df["gr_parties_net_wells"] = gr_parties_net_wells
-    df["dale_first_well_carry_wells"] = dale_first_well_carry_wells
-    df["dale_carry_dnc_net_wells"] = dale_carry_dnc_net_wells
-    df["funded_dnc_net_wells"] = funded_dnc_net_wells
+    def fmt_tc_name(x):
+        if pd.isnull(x):
+            return "-"
 
-    # First-production Granite carry:
-    # Period 0 is the spud / D&C month.
-    # Period 1 is the first modeled production month.
-    df["carry_reversion_active"] = (
-        carry_enabled & df["period"].gt(0)
-    )
-    df["ownership_factor"] = np.where(
-        df["carry_reversion_active"],
-        post_carry_ownership_factor,
-        1.0,
-    )
-    df["effective_working_interest"] = (
-        gr_parties_working_interest * df["ownership_factor"]
-    )
-    df["effective_net_wells"] = (
-        gr_parties_net_wells * df["ownership_factor"]
-    )
+        text = str(x)
+        parts = text.split("_")
 
-    # Helpful carry audit fields. The Granite carry is applied only after
-    # Dale's initial interest has first been removed from original WI.
-    df["pre_carry_working_interest"] = gr_parties_working_interest
-    df["post_carry_working_interest"] = (
-        gr_parties_working_interest * post_carry_ownership_factor
-    )
-    df["pre_carry_effective_nri"] = (
-        gr_parties_working_interest * lease_nri
-    )
-    df["post_carry_effective_nri"] = (
-        gr_parties_working_interest
-        * post_carry_ownership_factor
-        * lease_nri
-    )
-    df["pre_carry_net_wells"] = gr_parties_net_wells
-    df["post_carry_net_wells"] = (
-        gr_parties_net_wells * post_carry_ownership_factor
-    )
+        # Example:
+        # lean_cond_plus_wet_gas
+        # becomes:
+        # lean_cond_plus<br>wet_gas
+        if len(parts) >= 3:
+            first_line = "_".join(parts[:-2])
+            second_line = "_".join(parts[-2:])
+            return f"{first_line}<br>{second_line}"
 
-    df["slot_gross_oil_production"] = df["gross_oil_production"] * gross_wells
-    df["slot_gross_gas_production"] = df["gross_gas_production"] * gross_wells
-    df["slot_gross_ngl_production"] = df["gross_ngl_production"] * gross_wells
-    df["slot_gross_boe"] = df["monthly_production_boe"] * gross_wells
+        return text
 
-    # USEDC return cash flow uses USEDC's retained ownership after the Granite
-    # carry. The Dale payout OCF is calculated separately below using the full
-    # combined USEDC + Granite interest.
-    df["slot_net_oil_production"] = (
-        df["equity_oil_production"] * df["effective_net_wells"]
-    )
-    df["slot_net_gas_production"] = (
-        df["equity_gas_production"] * df["effective_net_wells"]
-    )
-    df["slot_net_ngl_production"] = (
-        df["equity_ngl_production"] * df["effective_net_wells"]
-    )
-    df["slot_net_boe"] = (
-        df["equity_oil_production"]
-        + df["equity_ngl_production"]
-        + (df["equity_gas_production"] / 6.0)
-    ) * df["effective_net_wells"]
+    def get_slot_return(slot_id, metric):
+        slot_id = int(slot_id)
+        return slot_returns.get(slot_id, {}).get(metric)
+    
+    gas_shrink_pct = {k: None for k in slot_map.keys()}
+    oil_eur_per_ft = {k: None for k in slot_map.keys()}
+    gas_eur_per_ft = {k: None for k in slot_map.keys()}
 
-    df["slot_oil_revenue"] = (
-        df["equity_oil_production"]
-        * df["local_oil_price"]
-        * df["effective_net_wells"]
-    )
-    df["slot_gas_revenue"] = (
-        df["equity_gas_production"]
-        * df["local_gas_price"]
-        * df["effective_net_wells"]
-    )
-    df["slot_ngl_revenue"] = (
-        df["equity_ngl_production"]
-        * df["local_ngl_price"]
-        * df["effective_net_wells"]
-    )
-    df["slot_total_revenue"] = (
-        df["slot_oil_revenue"]
-        + df["slot_gas_revenue"]
-        + df["slot_ngl_revenue"]
-    )
-    df["slot_loe"] = df["total_loe"] * df["effective_net_wells"]
-    df["slot_tax"] = df["tax"] * df["effective_net_wells"]
-    df["slot_operating_profit"] = (
-        df["slot_total_revenue"] + df["slot_loe"] + df["slot_tax"]
-    )
+    for slot_name, v in slot_map.items():
+        slot_one_row_df = pd.DataFrame([v]).copy()
 
-    # Dale payout is intentionally based on positive OCF after LOE and taxes,
-    # but before the USEDC-to-Granite carry split. It uses the combined USEDC +
-    # Granite / GR Parties interest after Dale's initial 1/16 has been removed.
-    df["slot_promote_ocf"] = (
-        df["operating_cf"] * gr_parties_net_wells
-    )
+        slot_inputs_prepped = prepare_slot_inputs(slot_one_row_df, deal_inputs)
+        slot_prepped = slot_inputs_prepped.iloc[0].copy()
 
-    # Base D&C covers the combined USEDC + Granite interest for every well
-    # after Dale's initial ownership is removed. Dale's initial 1/16 D&C is
-    # added only for the flagged first well in each physical unit.
-    df["slot_base_capex"] = (
-        df["capex"] * gr_parties_net_wells
-    )
-    df["slot_dale_carry_capex"] = (
-        df["capex"] * dale_carry_dnc_net_wells
-    )
-    df["slot_capex"] = (
-        df["slot_base_capex"] + df["slot_dale_carry_capex"]
-    )
+        deal_settings = prepare_deal_settings(deal_inputs)
+        global_assumptions = prepare_global_assumptions(deal_inputs)
+        type_curve_library = load_type_curve_library("type_curve_library.xlsx")
 
-    df["slot_pud_cash_flow"] = (
-        df["slot_operating_profit"] + df["slot_capex"]
-    )
-    df["slot_asset_purchase"] = 0.0
-    df["slot_promote"] = 0.0
-    df["slot_total_cash_flow"] = (
-        df["slot_pud_cash_flow"]
-        + df["slot_asset_purchase"]
-        + df["slot_promote"]
-    )
+        total_net_acres = float(slot_prepped.get("net_acres", 0.0))
 
-    # Preserve original ownership fields for backward-compatible outputs.
-    df["working_interest"] = base_working_interest
-    df["net_wells"] = base_net_wells
-    df["gross_wells"] = gross_wells
-    df["acquisition_cost"] = float(slot["acquisition_cost"])
-    df["bid_price_final"] = float(slot["bid_price_final"])
-    df["ngl_recovery_case"] = slot_ngl["recovery_case"]
-    df["slot_shrink"] = float(slot_ngl["shrink"])
-    df["slot_ngl_pct_of_wti"] = float(slot_ngl["ngl_pct_of_wti"])
-
-    return df
-
-def align_to_financial_calendar(slot_df, effective_date, months=360):
-    effective_date = (
-        pd.to_datetime(effective_date).to_period("M").to_timestamp()
-    )
-
-    slot_df = slot_df.copy()
-    slot_df["date"] = (
-        pd.to_datetime(slot_df["date"], errors="coerce")
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-
-    slot_start = slot_df["date"].min()
-    calendar_start = (
-        min(effective_date, slot_start)
-        if pd.notnull(slot_start)
-        else effective_date
-    )
-    calendar_end = effective_date + pd.DateOffset(months=months - 1)
-
-    calendar = pd.DataFrame(
-        {
-            "date": pd.date_range(
-                start=calendar_start,
-                end=calendar_end,
-                freq="MS",
-            )
-        }
-    )
-
-    df = calendar.merge(slot_df, on="date", how="left")
-
-    numeric_cols = [
-        col for col in df.select_dtypes(include=[np.number]).columns if col != "slot_id"
-    ]
-    df[numeric_cols] = df[numeric_cols].fillna(0)
-
-    object_cols = df.select_dtypes(include=["object"]).columns
-    for col in object_cols:
-        if col == "tc_name":
-            df[col] = df[col].fillna(
-                slot_df["tc_name"].iloc[0] if "tc_name" in slot_df.columns else ""
-            )
-        elif col == "ngl_recovery_case":
-            df[col] = df[col].fillna(
-                slot_df["ngl_recovery_case"].iloc[0]
-                if "ngl_recovery_case" in slot_df.columns
-                else ""
-            )
-
-    if "slot_id" in slot_df.columns:
-        df["slot_id"] = slot_df["slot_id"].iloc[0]
-
-    return df
-
-
-# -----------------------------
-# Deal build / rollup
-# -----------------------------
-def build_all_slot_financials(
-    slot_inputs, deal_settings, type_curve_library, global_assumptions
-):
-    slot_results = []
-    total_net_acres = pd.to_numeric(
-        slot_inputs["net_acres"], errors="coerce"
-    ).fillna(0).sum()
-
-    effective_date = pd.to_datetime(deal_settings["effective_date"])
-
-    for _, slot_row in slot_inputs.iterrows():
-        slot_df = build_slot_financials(
-            slot=slot_row,
+        slot_prepped = calc_slot_metrics(
+            slot_prepped,
             deal_settings=deal_settings,
-            type_curve_library=type_curve_library,
-            global_assumptions=global_assumptions,
             total_net_acres=total_net_acres,
         )
 
-        slot_df = align_to_financial_calendar(
-            slot_df,
-            deal_settings["effective_date"],
-            months=360,
-        )
-
-        # Repopulate the monthly index prices across the entire
-        # aligned 360-month calendar.
-        aligned_index_pricing = build_index_price_series(
-            dates=slot_df["date"],
+        slot_ngl = build_slot_ngl_factors(
+            slot=slot_prepped,
             global_assumptions=global_assumptions,
+            content_percentages=global_assumptions["content_percentages"],
+            recover_ethane_percentages=global_assumptions["recover_ethane_percentages"],
+            reject_ethane_percentages=global_assumptions["reject_ethane_percentages"],
+            ngl_prices=global_assumptions["ngl_prices"],
+            ngl_shrink_factors=global_assumptions["ngl_shrink_factors"],
         )
-        
-        slot_df = (
-            slot_df
-            .drop(
-                columns=[
-                    "index_oil_price",
-                    "index_gas_price",
-                ],
-                errors="ignore",
+
+        one_well_df = run_single_slot_economics(
+            slot=slot_prepped,
+            type_curve_library=type_curve_library,
+            global_assumptions=global_assumptions,
+            slot_ngl=slot_ngl,
+        ).copy()
+
+        prod_df = one_well_df[one_well_df["period"].between(1, 360)].copy()
+
+        lateral_length = (
+            float(slot_prepped["lateral_length"])
+            if pd.notnull(slot_prepped["lateral_length"]) and float(slot_prepped["lateral_length"]) != 0
+            else None
+        )
+
+        gas_shrink_pct[slot_name] = float(slot_ngl["shrink"])
+
+        if lateral_length:
+            oil_eur_per_ft[slot_name] = (
+                prod_df["gross_oil_production"].sum() / lateral_length
             )
-            .merge(
-                aligned_index_pricing,
-                on="date",
-                how="left",
+            
+            gas_eur_per_ft[slot_name] = (
+                prod_df["gross_gas_production"].sum() / lateral_length
             )
-        )
-
-        # These are slot-level attributes and must remain populated on every
-        # aligned calendar row, including the acquisition month before spud.
-        slot_df["dale_promote"] = bool(slot_row.get("dale_promote", False))
-        slot_df["dale_unit_id"] = str(
-            slot_row.get("dale_unit_id", f"UNIT-{int(slot_row['slot_id'])}")
-        ).strip()
-        slot_df["dale_payout_group"] = str(
-            slot_row.get("dale_payout_group", slot_df["dale_unit_id"].iloc[0])
-        ).strip()
-        slot_df["dale_first_well_carry"] = bool(
-            slot_row.get("dale_first_well_carry", False)
-        )
-        slot_df["carry_enabled"] = bool(slot_row.get("carry_enabled", False))
-
-        slot_calc = calc_slot_metrics(slot_row, deal_settings, total_net_acres)
-
-        slot_df["slot_asset_purchase"] = 0.0
-        mask = (
-            (slot_df["date"].dt.year == effective_date.year)
-            & (slot_df["date"].dt.month == effective_date.month)
-        )
-        slot_df.loc[mask, "slot_asset_purchase"] = -float(
-            slot_calc["acquisition_cost"]
-        )
-
-        if "slot_promote" not in slot_df.columns:
-            slot_df["slot_promote"] = 0.0
-
-        slot_df["slot_total_cash_flow"] = (
-            slot_df["slot_pud_cash_flow"]
-            + slot_df["slot_asset_purchase"]
-            + slot_df["slot_promote"]
-        )
-
-        slot_results.append(slot_df)
-
-    return pd.concat(slot_results, ignore_index=True)
-
-
-
-def roll_up_deal(all_slots_df):
-    sum_cols = [
-        "slot_gross_oil_production",
-        "slot_gross_gas_production",
-        "slot_gross_ngl_production",
-        "slot_gross_boe",
-        "slot_net_oil_production",
-        "slot_net_gas_production",
-        "slot_net_ngl_production",
-        "slot_net_boe",
-        "slot_oil_revenue",
-        "slot_gas_revenue",
-        "slot_ngl_revenue",
-        "slot_total_revenue",
-        "slot_loe",
-        "slot_tax",
-        "slot_operating_profit",
-        "slot_promote_ocf",
-        "slot_base_capex",
-        "slot_dale_carry_capex",
-        "slot_capex",
-        "slot_pud_cash_flow",
-        "slot_asset_purchase",
-        "slot_total_cash_flow",
-    ]
-
-    existing_sum_cols = [c for c in sum_cols if c in all_slots_df.columns]
-    deal_df = (
-        all_slots_df.groupby("date", as_index=False)[existing_sum_cols]
-        .sum()
-        .sort_values("date")
-        .reset_index(drop=True)
+            
+    add_section("Development")
+    add_data("Type Curve", {k: fmt_tc_name(v["tc_name"]) for k, v in slot_map.items()})
+    add_data("Gross Wells", {k: fmt_num(v["gross_wells"], decimals=2) for k, v in slot_map.items()})
+    add_data("Net Acres", {k: fmt_num(v["net_acres"], decimals=1) for k, v in slot_map.items()})
+    add_data("Unit Acres", {k: fmt_num(v["unit_acres"], decimals=0) for k, v in slot_map.items()})
+    add_data("% Unitized", {k: fmt_pct(v["pct_unitized"], decimals=0) for k, v in slot_map.items()})
+    add_data("Spud Month", {k: fmt_date(v["drilling_spud_month"]) for k, v in slot_map.items()})
+    add_data("Flowback Delay", {k: fmt_num(v["flowback_delay"], decimals=0) for k, v in slot_map.items()})
+    add_data("Lateral Length (ft)", {k: fmt_num(v["lateral_length"], decimals=0) for k, v in slot_map.items()})
+    add_data(
+        "WI Reversion Eligible",
+        {k: ("Yes" if bool(v.get("dale_promote", False)) else "No") for k, v in slot_map.items()},
     )
 
-    # Each payout group has its own hurdle schedule. Build a non-duplicated
-    # portfolio summary for the deal-level audit; activation still occurs at
-    # the individual payout-group level in apply_promote_to_slots().
-    schedule_cols = [
-        "promote_monthly_investment",
-        "promote_monthly_distributions",
-        "promote_cumulative_investment",
-        "promote_cumulative_distributions",
-        "promote_running_multiple",
-        "promote_hurdle_reached",
-        "promote_active",
-        "promote_hurdle_date",
-        "promote_effective_date",
-    ]
-    required = {"dale_payout_group", "date", *schedule_cols}
+    add_gap()
 
-    if required.issubset(all_slots_df.columns):
-        group_schedule = (
-            all_slots_df.loc[
-                all_slots_df["dale_promote"].fillna(False),
-                ["dale_payout_group", "date", *schedule_cols],
-            ]
-            .drop_duplicates(["dale_payout_group", "date"])
-            .copy()
-        )
+    add_section("Production")
+    add_data("TC Risk", {k: fmt_pct(v["tc_risk"], decimals=0) for k, v in slot_map.items()})
+    add_data("NRI", {k: fmt_pct(v["net_revenue_interest"], decimals=0) for k, v in slot_map.items()})
+    add_data("Gas Shrink %", {k: fmt_pct(gas_shrink_pct[k], decimals=1) for k in slot_map.keys()})
+    add_data("Oil EUR (Bbl/ft)", {k: fmt_num(oil_eur_per_ft[k], decimals=0) for k in slot_map.keys()})
+    add_data("Gas EUR (Mcf/ft)", {k: fmt_num(gas_eur_per_ft[k], decimals=0) for k in slot_map.keys()})
+    add_data("NGL Yield", {k: fmt_num(v["ngl_yield"], decimals=2) for k, v in slot_map.items()})
+    
+    add_gap()
+    
+    add_section("Returns")
+    add_data(
+        "IRR",
+        {
+            k: fmt_pct(get_slot_return(v["slot_id"], "irr"), decimals=1)
+            for k, v in slot_map.items()
+        },
+    )
+    add_data(
+        "MOIC",
+        {
+            k: fmt_num(get_slot_return(v["slot_id"], "moic"), decimals=2, suffix="x")
+            for k, v in slot_map.items()
+        },
+    )
+    
+    add_gap()
+    
+    add_section("Economics")
+    add_data("D&C ($/ft)", {k: fmt_num(v["dc_costs"], decimals=0, prefix="$") for k, v in slot_map.items()})
+    add_data("$/Acre Bid", {k: fmt_num(v["bid_per_acre"], decimals=0, prefix="$") for k, v in slot_map.items()})
+    add_data("Oil Diff", {k: fmt_num(v["oil_diff"], decimals=2, prefix="$") for k, v in slot_map.items()})
+    add_data("Gas Diff", {k: fmt_num(v["gas_diff"], decimals=2, prefix="$") for k, v in slot_map.items()})
 
-        if not group_schedule.empty:
-            numeric_cols = [
-                "promote_monthly_investment",
-                "promote_monthly_distributions",
-                "promote_cumulative_investment",
-                "promote_cumulative_distributions",
-            ]
-            summary = (
-                group_schedule.groupby("date", as_index=False)[numeric_cols]
-                .sum()
-                .sort_values("date")
-            )
+    add_gap()
 
-            bool_summary = (
-                group_schedule.groupby("date", as_index=False)[
-                    ["promote_hurdle_reached", "promote_active"]
-                ]
-                .any()
-            )
-            summary = summary.merge(bool_summary, on="date", how="left")
+    add_section("Operating Costs")
+    add_data("Oil Opex", {k: fmt_num(v["oil_opex_bbl"], decimals=2, prefix="$") for k, v in slot_map.items()})
+    add_data("Gas Opex", {k: fmt_num(v["gas_opex_mcf"], decimals=2, prefix="$") for k, v in slot_map.items()})
+    add_data("NGL Opex", {k: fmt_num(v["ngl_opex"], decimals=2, prefix="$") for k, v in slot_map.items()})
+    add_data("Fixed LOE", {k: fmt_num(v["fixed_loe"], decimals=0, prefix="$") for k, v in slot_map.items()}, style="footer")
 
-            summary["promote_running_multiple"] = np.where(
-                summary["promote_cumulative_investment"] > 0.0,
-                summary["promote_cumulative_distributions"]
-                / summary["promote_cumulative_investment"],
-                0.0,
-            )
+    display_df = pd.DataFrame(rows)
+    return display_df, row_styles
 
-            first_dates = (
-                group_schedule.groupby("dale_payout_group", as_index=False)[
-                    ["promote_hurdle_date", "promote_effective_date"]
-                ]
-                .first()
-            )
-            earliest_hurdle = pd.to_datetime(
-                first_dates["promote_hurdle_date"], errors="coerce"
-            ).min()
-            earliest_effective = pd.to_datetime(
-                first_dates["promote_effective_date"], errors="coerce"
-            ).min()
-            summary["promote_hurdle_date"] = earliest_hurdle
-            summary["promote_effective_date"] = earliest_effective
+def style_tc_assumptions_output_table(display_df, row_styles):
+    style_map = pd.Series(row_styles, index=display_df.index)
 
-            active_counts = (
-                group_schedule.groupby("date")["promote_active"]
-                .sum()
-                .rename("promote_active_group_count")
-                .reset_index()
-            )
-            total_groups = int(group_schedule["dale_payout_group"].nunique())
-            summary = summary.merge(active_counts, on="date", how="left")
-            summary["promote_total_group_count"] = total_groups
+    first_col = display_df.columns[0]
+    other_cols = list(display_df.columns[1:])
 
-            deal_df = deal_df.merge(summary, on="date", how="left")
+    def row_style(row):
+        rtype = style_map.loc[row.name]
+        styles = [""] * len(row)
 
-    return deal_df
+        if rtype == "section":
+            styles = ["font-weight: 700; text-align: left;"] + [""] * (len(row) - 1)
+        elif rtype == "footer":
+            styles = [f"background-color: {QUARTERLY_HEADER_COLOR}; color: white; font-weight: 700;"] * len(row)
+        elif rtype == "gap":
+            styles = [""] * len(row)
 
+        return styles
 
-def build_promote_schedule(promoted_rows, deal_settings):
-    """Build a separate Dale payout schedule for each unit or well tranche.
+    return (
+    display_df.style
+    .apply(row_style, axis=1)
+    .hide(axis="index")
+    .set_properties(subset=[first_col], **{
+        "text-align": "left",
+        "white-space": "pre-wrap",
+        "background-color": "white",
+        "width": "180px",
+        "min-width": "180px",
+        "max-width": "180px",
+    })
+    .set_properties(subset=other_cols, **{
+        "text-align": "right",
+        "background-color": "white",
+        "white-space": "normal",
+        "overflow-wrap": "anywhere",
+        "word-break": "break-word",
+        "vertical-align": "top",
+    })
+    .set_table_styles([
+        {
+            "selector": "table",
+            "props": [
+                ("border-collapse", "separate"),
+                ("border-spacing", "0"),
+                ("width", "100%"),
+                ("table-layout", "fixed"),
+            ],
+        },
+        {
+            "selector": "thead th",
+            "props": [
+                ("background-color", QUARTERLY_HEADER_COLOR),
+                ("color", "white"),
+                ("font-weight", "700"),
+                ("text-align", "center"),
+                ("border", "none"),
+                ("padding", "4px 8px"),
+                ("font-size", "12px"),
+                ("white-space", "normal"),
+                ("overflow-wrap", "anywhere"),
+                ("word-break", "break-word"),
+            ],
+        },
+        {
+            "selector": "thead th.col0",
+            "props": [
+                ("text-align", "left"),
+                ("width", "180px"),
+                ("min-width", "180px"),
+                ("max-width", "180px"),
+            ],
+        },
+        {
+            "selector": "thead th:not(.col0)",
+            "props": [
+                ("width", "120px"),
+                ("min-width", "120px"),
+                ("max-width", "120px"),
+            ],
+        },
+        {
+            "selector": "tbody td",
+            "props": [
+                ("border", "none"),
+                ("padding", "4px 8px"),
+                ("font-size", "12px"),
+                ("vertical-align", "top"),
+            ],
+        },
+        {
+            "selector": "tbody td.col0",
+            "props": [
+                ("text-align", "left"),
+                ("white-space", "pre-wrap"),
+                ("width", "180px"),
+                ("min-width", "180px"),
+                ("max-width", "180px"),
+            ],
+        },
+        {
+            "selector": "tbody td:not(.col0)",
+            "props": [
+                ("text-align", "right"),
+                ("white-space", "normal"),
+                ("overflow-wrap", "anywhere"),
+                ("word-break", "break-word"),
+                ("width", "120px"),
+                ("min-width", "120px"),
+                ("max-width", "120px"),
+            ],
+        },
+    ], overwrite=False)
+)
 
-    The denominator is acquisition cost plus all D&C funded by USEDC,
-    including the flagged first-well D&C carry for Dale's initial interest.
-    The numerator is positive OCF after LOE and taxes for the combined USEDC +
-    Granite / GR Parties interest, before the USEDC-to-Granite carry split.
-    The additional WI back-in becomes effective in the following modeled month.
-    """
-    group_col = "dale_payout_group"
-    monthly = (
-        promoted_rows.groupby([group_col, "date"], as_index=False)[
-            ["slot_promote_ocf", "slot_capex", "slot_asset_purchase"]
-        ]
-        .sum()
-        .sort_values([group_col, "date"])
-        .reset_index(drop=True)
+def render_deal_highlight_box(title, value):
+    st.markdown(
+        f"""
+        <div style="
+            background-color: {QUARTERLY_HEADER_COLOR};
+            color: white;
+            padding: 14px 10px;
+            border-radius: 6px;
+            text-align: center;
+            font-weight: 700;
+        ">
+            <div style="font-size: 13px; margin-bottom: 6px;">{title}</div>
+            <div style="font-size: 24px;">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    monthly["promote_monthly_investment"] = (
-        -monthly["slot_asset_purchase"].clip(upper=0.0)
-        -monthly["slot_capex"].clip(upper=0.0)
-    )
-    monthly["promote_monthly_distributions"] = monthly[
-        "slot_promote_ocf"
-    ].clip(lower=0.0)
 
-    monthly["promote_cumulative_investment"] = monthly.groupby(group_col)[
-        "promote_monthly_investment"
-    ].cumsum()
-    monthly["promote_cumulative_distributions"] = monthly.groupby(group_col)[
-        "promote_monthly_distributions"
-    ].cumsum()
+def build_production_profile_chart(deal_df, chart_view="Stacked Mcfe/d"):
+    df = deal_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"] <= pd.Timestamp("2040-12-31")].copy()
 
-    invested = monthly["promote_cumulative_investment"]
-    monthly["promote_running_multiple"] = np.where(
-        invested > 0.0,
-        monthly["promote_cumulative_distributions"] / invested,
-        0.0,
+    # Convert monthly net volumes to Mcfe/d
+    df["days_in_month"] = df["date"].dt.days_in_month
+    df["net_oil_mcfe_d"] = (df["slot_net_oil_production"] * 6.0) / df["days_in_month"]
+    df["net_ngl_mcfe_d"] = (df["slot_net_ngl_production"] * 6.0) / df["days_in_month"]
+    df["net_gas_mcfe_d"] = df["slot_net_gas_production"] / df["days_in_month"]
+
+    # Optional total line if you ever want it later
+    df["total_mcfe_d"] = (
+        df["net_oil_mcfe_d"] + df["net_ngl_mcfe_d"] + df["net_gas_mcfe_d"]
     )
 
-    hurdle = float(deal_settings.get("promote_multiple", 0.0))
-    monthly["promote_hurdle_reached"] = (
-        (invested > 0.0)
-        & (monthly["promote_running_multiple"] >= hurdle)
-    )
+    fig = go.Figure()
 
-    vested = monthly.groupby(group_col)[
-        "promote_hurdle_reached"
-    ].cummax()
-    monthly["promote_active"] = (
-        vested.groupby(monthly[group_col])
-        .shift(1, fill_value=False)
-        .astype(bool)
-    )
+    oil_color = "#1f4e79"
+    ngl_color = "#4e80b1"
+    gas_color = "#b7cde3"
 
-    hurdle_dates = (
-        monthly.loc[monthly["promote_hurdle_reached"]]
-        .groupby(group_col)["date"]
-        .min()
-    )
-    effective_dates = (
-        monthly.loc[monthly["promote_active"]]
-        .groupby(group_col)["date"]
-        .min()
-    )
-    monthly["promote_hurdle_date"] = monthly[group_col].map(hurdle_dates)
-    monthly["promote_effective_date"] = monthly[group_col].map(effective_dates)
-
-    return monthly[
-        [
-            group_col,
-            "date",
-            "promote_monthly_investment",
-            "promote_monthly_distributions",
-            "promote_cumulative_investment",
-            "promote_cumulative_distributions",
-            "promote_running_multiple",
-            "promote_hurdle_reached",
-            "promote_active",
-            "promote_hurdle_date",
-            "promote_effective_date",
-        ]
-    ]
-
-
-def apply_promote_to_slots(all_slots_df, deal_settings):
-    """Apply each payout group's permanent Dale WI back-in."""
-    df = all_slots_df.copy().sort_values(["date", "slot_id"]).reset_index(drop=True)
-
-    if "dale_promote" not in df.columns:
-        df["dale_promote"] = False
-    if "dale_payout_group" not in df.columns:
-        df["dale_payout_group"] = (
-            "SLOT-" + pd.to_numeric(df["slot_id"], errors="coerce")
-            .fillna(0)
-            .astype(int)
-            .astype(str)
-        )
-
-    df["dale_promote"] = df["dale_promote"].fillna(False).astype(bool)
-    df["dale_payout_group"] = df["dale_payout_group"].fillna("").astype(str)
-    df["slot_promote"] = 0.0
-
-    # Baseline ownership is USEDC's WI after the Granite carry but before the
-    # additional Dale back-in. Therefore the extra 6.25% is shared fairly by
-    # USEDC and Granite: USEDC loses 6.25% of its own then-current WI.
-    df["pre_promote_working_interest"] = df["effective_working_interest"]
-    df["pre_promote_net_wells"] = df["effective_net_wells"]
-    df["promote_ownership_factor"] = 1.0
-    df["promote_wi_transferred"] = 0.0
-    df["post_promote_working_interest"] = df["pre_promote_working_interest"]
-    df["post_promote_net_wells"] = df["pre_promote_net_wells"]
-
-    schedule_defaults = {
-        "promote_monthly_investment": 0.0,
-        "promote_monthly_distributions": 0.0,
-        "promote_cumulative_investment": 0.0,
-        "promote_cumulative_distributions": 0.0,
-        "promote_running_multiple": 0.0,
-        "promote_hurdle_reached": False,
-        "promote_active": False,
-        "promote_hurdle_date": pd.NaT,
-        "promote_effective_date": pd.NaT,
-    }
-    for col, default in schedule_defaults.items():
-        df[col] = default
-
-    promoted_mask = df["dale_promote"]
-    promote_enabled = bool(deal_settings.get("promote_enabled", False))
-
-    if promote_enabled and promoted_mask.any():
-        schedule = build_promote_schedule(
-            df.loc[promoted_mask].copy(),
-            deal_settings,
-        )
-
-        schedule_cols = [
-            c for c in schedule.columns
-            if c not in {"dale_payout_group", "date"}
-        ]
-        df = df.drop(columns=schedule_cols, errors="ignore").merge(
-            schedule,
-            on=["dale_payout_group", "date"],
-            how="left",
-        )
-
-        numeric_schedule_cols = [
-            "promote_monthly_investment",
-            "promote_monthly_distributions",
-            "promote_cumulative_investment",
-            "promote_cumulative_distributions",
-            "promote_running_multiple",
-        ]
-        df[numeric_schedule_cols] = df[numeric_schedule_cols].fillna(0.0)
-        df["promote_hurdle_reached"] = (
-            df["promote_hurdle_reached"].fillna(False).astype(bool)
-        )
-        df["promote_active"] = df["promote_active"].fillna(False).astype(bool)
-
-        wi_reversion_pct = float(
-            np.clip(
-                deal_settings.get("promote_wi_reversion_pct", 0.0),
-                0.0,
-                1.0,
+    if chart_view == "Stacked Mcfe/d":
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_oil_mcfe_d"],
+                mode="lines",
+                name="Oil",
+                stackgroup="one",
+                line=dict(color=oil_color, width=1.5),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net Oil: %{y:,.1f} Mcfe/d<extra></extra>",
             )
         )
-        post_promote_factor = 1.0 - wi_reversion_pct
-        active_promoted_mask = df["dale_promote"] & df["promote_active"]
 
-        df.loc[active_promoted_mask, "promote_ownership_factor"] = (
-            post_promote_factor
-        )
-        df.loc[active_promoted_mask, "promote_wi_transferred"] = (
-            df.loc[active_promoted_mask, "pre_promote_working_interest"]
-            * wi_reversion_pct
-        )
-        df["post_promote_working_interest"] = (
-            df["pre_promote_working_interest"]
-            * df["promote_ownership_factor"]
-        )
-        df["post_promote_net_wells"] = (
-            df["pre_promote_net_wells"]
-            * df["promote_ownership_factor"]
-        )
-
-        # Scale USEDC's ownership economics after the back-in. Dale's separate
-        # first-well carry capex is an obligation and is not itself an ownership
-        # interest, so only base D&C is scaled if future capex occurs after vesting.
-        scale_cols = [
-            "slot_net_oil_production",
-            "slot_net_gas_production",
-            "slot_net_ngl_production",
-            "slot_net_boe",
-            "slot_oil_revenue",
-            "slot_gas_revenue",
-            "slot_ngl_revenue",
-            "slot_total_revenue",
-            "slot_loe",
-            "slot_tax",
-            "slot_operating_profit",
-            "slot_base_capex",
-        ]
-        existing_scale_cols = [c for c in scale_cols if c in df.columns]
-        df.loc[active_promoted_mask, existing_scale_cols] = (
-            df.loc[active_promoted_mask, existing_scale_cols]
-            .multiply(post_promote_factor)
-        )
-
-        if {"slot_base_capex", "slot_dale_carry_capex"}.issubset(df.columns):
-            df["slot_capex"] = (
-                df["slot_base_capex"] + df["slot_dale_carry_capex"]
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_ngl_mcfe_d"],
+                mode="lines",
+                name="NGL",
+                stackgroup="one",
+                line=dict(color=ngl_color, width=1.5),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net NGL: %{y:,.1f} Mcfe/d<extra></extra>",
             )
-
-        df.loc[active_promoted_mask, "effective_working_interest"] = df.loc[
-            active_promoted_mask, "post_promote_working_interest"
-        ]
-        df.loc[active_promoted_mask, "effective_net_wells"] = df.loc[
-            active_promoted_mask, "post_promote_net_wells"
-        ]
-        df.loc[active_promoted_mask, "ownership_factor"] = (
-            df.loc[active_promoted_mask, "ownership_factor"]
-            * post_promote_factor
         )
 
-    df["slot_pud_cash_flow"] = df["slot_operating_profit"] + df["slot_capex"]
-    df["slot_total_cash_flow"] = (
-        df["slot_pud_cash_flow"] + df["slot_asset_purchase"]
-    )
-
-    return df.sort_values(["slot_id", "date"]).reset_index(drop=True)
-
-def calc_financial_irr(df):
-    if pyxirr is None:
-        return None
-    try:
-        return float(pyxirr.xirr(df["date"], df["slot_total_cash_flow"]))
-    except Exception:
-        return None
-
-
-def calc_financial_moic(df):
-    invested = -df.loc[df["slot_total_cash_flow"] < 0, "slot_total_cash_flow"].sum()
-    returned = df.loc[df["slot_total_cash_flow"] > 0, "slot_total_cash_flow"].sum()
-
-    if invested == 0:
-        return None
-
-    return float(returned / invested)
-
-
-# -----------------------------
-# Input prep
-# -----------------------------
-
-def prepare_deal_settings(deal_inputs):
-    effective_date = pd.to_datetime(
-        deal_inputs.get("effective_date", default_effective_date())
-    )
-
-    promote_enabled = bool(deal_inputs.get("promote_enabled", False))
-
-    if "promote_wi_reversion_pct" in deal_inputs:
-        promote_wi_reversion_pct = (
-            float(deal_inputs.get("promote_wi_reversion_pct", 0.0)) / 100.0
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_gas_mcfe_d"],
+                mode="lines",
+                name="Gas",
+                stackgroup="one",
+                line=dict(color=gas_color, width=1.5),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net Gas: %{y:,.1f} Mcfe/d<extra></extra>",
+            )
         )
+
+        chart_title = "Net Production Profile (Mcfe/d)"
     else:
-        promote_wi_reversion_pct = float(deal_inputs.get("promote_rate", 0.0))
-        if promote_wi_reversion_pct > 1.0:
-            promote_wi_reversion_pct /= 100.0
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_oil_mcfe_d"],
+                mode="lines",
+                name="Oil",
+                line=dict(color=oil_color, width=3),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net Oil: %{y:,.1f} Mcfe/d<extra></extra>",
+            )
+        )
 
-    promote_wi_reversion_pct = float(
-        np.clip(promote_wi_reversion_pct, 0.0, 1.0)
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_ngl_mcfe_d"],
+                mode="lines",
+                name="NGL",
+                line=dict(color=ngl_color, width=3),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net NGL: %{y:,.1f} Mcfe/d<extra></extra>",
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df["date"],
+                y=df["net_gas_mcfe_d"],
+                mode="lines",
+                name="Gas",
+                line=dict(color=gas_color, width=3),
+                hovertemplate="Date: %{x|%Y-%m-%d}<br>Net Gas: %{y:,.1f} Mcfe/d<extra></extra>",
+            )
+        )
+
+        chart_title = "Net Production Stream Split (Mcfe/d)"
+
+    fig.update_layout(
+        title=dict(
+            text=chart_title,
+            font=dict(color="black"),
+        ),
+        xaxis=dict(
+            title=dict(text="Date", font=dict(color="black")),
+            tickformat="%Y",
+            dtick="M12",
+            tickfont=dict(color="black"),
+        ),
+        yaxis=dict(
+            title=dict(text="Net Production (Mcfe/d)", font=dict(color="black")),
+            tickfont=dict(color="black"),
+        ),
+        
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.18,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=17, color="black"),
+            traceorder="normal",
+            entrywidth=200,
+            entrywidthmode="pixels",
+            tracegroupgap=28,
+        ),
+    )
+    
+    fig.update_xaxes(
+        tickfont=dict(size=13, color="black"),
+        title_font=dict(size=15, color="black"),
+    )
+        
+    fig.update_yaxes(
+        tickfont=dict(size=13, color="black"),
+        title_font=dict(size=15, color="black"),
     )
 
-    # Whole-percent app input: 6.25 means Dale initially owns 1/16 of the
-    # acquired lease. The slot WI is assumed to be the remaining GR-side WI.
-    dale_initial_interest_pct = float(
-        np.clip(
-            float(deal_inputs.get("dale_initial_interest_pct", 6.25)) / 100.0,
-            0.0,
-            0.999999,
+    return fig
+
+def build_cumulative_fcf_chart(deal_df, slot_df):
+    df = deal_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"] <= pd.Timestamp("2040-12-31")].copy()
+
+    monthly_fcf = df.groupby("date", as_index=False)["slot_total_cash_flow"].sum()
+    monthly_fcf["cum_fcf"] = monthly_fcf["slot_total_cash_flow"].cumsum() / 1000.0
+
+    payback_years = None
+    payback_date = None
+
+    for i in range(1, len(monthly_fcf)):
+        prev_val = monthly_fcf.loc[i - 1, "cum_fcf"]
+        curr_val = monthly_fcf.loc[i, "cum_fcf"]
+
+        if prev_val < 0 <= curr_val:
+            prev_date = monthly_fcf.loc[i - 1, "date"]
+            curr_date = monthly_fcf.loc[i, "date"]
+
+            frac = 0 if curr_val == prev_val else (0 - prev_val) / (curr_val - prev_val)
+            payback_date = prev_date + (curr_date - prev_date) * frac
+            start_date = monthly_fcf.loc[0, "date"]
+            payback_years = (payback_date - start_date).days / 365.25
+            break
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=monthly_fcf["date"],
+            y=monthly_fcf["cum_fcf"],
+            mode="lines",
+            name="Cumulative FCF",
+            line=dict(color="#4E80B1", width=3),
+            fill="tozeroy",
+            fillcolor="rgba(78, 128, 177, 0.28)",
+            hovertemplate="Date: %{x|%Y-%m-%d}<br>Cumulative FCF: %{y:,.1f}<extra></extra>",
         )
     )
 
-    return {
-        "effective_date": effective_date,
-        "use_bid_override": bool(deal_inputs.get("use_bid_override", False)),
-        "bid_override": max(1.0, float(deal_inputs.get("bid_override", 1.0))),
-        "use_acquisition_override": bool(
-            deal_inputs.get("use_acquisition_override", False)
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="gray")
+
+    slot_chart = slot_df.copy()
+    slot_chart["drilling_spud_month"] = pd.to_datetime(
+        slot_chart["drilling_spud_month"], errors="coerce"
+    )
+    slot_chart = slot_chart[
+        slot_chart["drilling_spud_month"] <= pd.Timestamp("2040-12-31")
+    ].copy()
+
+    if not slot_chart.empty:
+        spud_summary = (
+            slot_chart.groupby("drilling_spud_month", as_index=False)["gross_wells"]
+            .sum()
+            .sort_values("drilling_spud_month")
+        )
+    
+        for _, row in spud_summary.iterrows():
+            spud_date = row["drilling_spud_month"]
+            gross_wells = row["gross_wells"]
+    
+            x0 = spud_date
+            x1 = spud_date + pd.offsets.MonthEnd(1)
+    
+            # 🔹 Soft shaded band (no outline)
+            fig.add_vrect(
+                x0=x0,
+                x1=x1,
+                fillcolor="rgba(78, 128, 177, 0.18)",  # softer fill
+                line_width=0,  # removes harsh border
+                layer="below",
+            )
+    
+            # 🔹 Move Gross Wells LOWER so it never conflicts with payback
+            fig.add_annotation(
+                x=spud_date + pd.Timedelta(days=14),
+                y=0.88,
+                yref="paper",
+                text=f"{gross_wells:.1f} Gross Wells",
+                showarrow=False,
+                textangle=-90,
+                font=dict(size=10, color="black"),
+                bgcolor="rgba(255,255,255,0)",
+                bordercolor="rgba(0,0,0,0)",
+                borderwidth=0,
+                xanchor="center",
+                yanchor="middle",
+            )
+            
+    if payback_date is not None and payback_years is not None:
+        fig.add_vline(
+            x=payback_date,
+            line_width=1,
+            line_dash="dot",
+            line_color="gray",
+        )
+
+        fig.add_annotation(
+            x=payback_date,
+            y=1.08,
+            yref="paper",
+            text=f"<b>Payback = {payback_years:.1f} years</b>",
+            showarrow=True,
+            arrowhead=2,
+            ax=0,
+            ay=28,
+            font=dict(size=16, color="black"),  # slightly bigger
+            bgcolor="rgba(255,255,255,0)",     # no box
+            bordercolor="rgba(0,0,0,0)",
+            borderwidth=0,
+        )
+
+    fig.update_layout(
+        title=dict(
+            text="<b>Cumulative Free Cash Flow</b>",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=20, color="black"),
         ),
-        "acquisition_cost_override": float(
-            deal_inputs.get("acquisition_cost_override", 0.0)
+        xaxis=dict(
+            title=dict(text="Date", font=dict(size=14, color="black")),
+            tickformat="%Y",
+            dtick="M12",
+            tickfont=dict(size=12, color="black"),
         ),
-        "promote_enabled": promote_enabled,
-        "dale_initial_interest_pct": dale_initial_interest_pct,
-        "promote_wi_reversion_pct": (
-            promote_wi_reversion_pct if promote_enabled else 0.0
+        yaxis=dict(
+            title=dict(text="$ in Thousands", font=dict(size=14, color="black")),
+            tickfont=dict(size=12, color="black"),
         ),
-        "promote_multiple": (
-            float(deal_inputs.get("promote_multiple", 0.0))
-            if promote_enabled
-            else 0.0
-        ),
+        height=525,
+        margin=dict(l=50, r=40, t=95, b=45),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+    )
+
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.08)")
+
+    return fig
+
+@st.cache_data(show_spinner=False)
+def build_scenario_scatter_chart(slot_df, deal_inputs, base_bid, base_dc):
+    bid_values = build_sensitivity_range(
+        base_bid,
+        500.0,
+        3,
+        min_value=1.0,
+    )
+
+    dc_cases = [
+        ("Low", base_dc - 50.0),
+        ("Base", base_dc),
+        ("High", base_dc + 50.0),
+    ]
+    
+    tc_risk_values = [0.80, 1.00, 1.20]
+
+    base_oil = float(deal_inputs["oil_price"])
+    base_gas = float(deal_inputs["gas_price"])
+
+    pricing_cases = [
+        ("Downside", max(0.0, base_oil - 5.0), max(0.0, base_gas - 0.25)),
+        ("Base", base_oil, base_gas),
+        ("Upside", base_oil + 5.0, base_gas + 0.25),
+    ]
+
+    rows = []
+
+    for pricing_name, oil_price, gas_price in pricing_cases:
+        for dc_label, dc_value in dc_cases:
+            for tc_risk in tc_risk_values:
+                for bid in bid_values:
+                    sens_inputs = deal_inputs.copy()
+                    sens_inputs["oil_price"] = float(oil_price)
+                    sens_inputs["gas_price"] = float(gas_price)
+                    sens_inputs["use_bid_override"] = True
+                    sens_inputs["bid_override"] = float(bid)
+                    sens_inputs["use_dc_override"] = True
+                    sens_inputs["dc_override"] = float(dc_value)
+
+                    sens_slot_df = slot_df.copy()
+                    sens_slot_df["tc_risk"] = float(tc_risk)
+
+                    try:
+                        irr, moic = run_deal_metrics(sens_slot_df, sens_inputs)
+                    except Exception:
+                        irr, moic = None, None
+
+                    rows.append(
+                        {
+                            "pricing_case": pricing_name,
+                            "oil_price": oil_price,
+                            "gas_price": gas_price,
+                            "dc_case": dc_label,
+                            "dc_value": dc_value,
+                            "tc_risk": tc_risk,
+                            "bid": bid,
+                            "irr": irr,
+                            "moic": moic,
+                        }
+                    )
+
+    chart_df = pd.DataFrame(rows)
+    chart_df = chart_df[pd.notnull(chart_df["irr"])].copy()
+
+    color_map = {
+        "Low": "#9ECAE1",
+        "Base": "#4E80B1",
+        "High": "#1F4E79",
     }
 
-def prepare_global_assumptions(deal_inputs):
-    use_sev_tax_pct = bool(
-        deal_inputs.get("use_sev_tax_pct", False)
+    size_map = {
+        0.80: 10,
+        1.00: 20,
+        1.20: 32,
+    }
+
+    dc_label_map = {
+        "Low": f"Low (${base_dc - 100.0:,.0f}/ft)",
+        "Base": f"Base (${base_dc:,.0f}/ft)",
+        "High": f"High (${base_dc + 100.0:,.0f}/ft)",
+    }
+    
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
     )
+    
+    panel_col_map = {"Downside": 1, "Base": 2, "Upside": 3}
+    legend_seen = set()
+    tc_jitter = {
+        0.90: 0,
+        1.00: 0,
+        1.10: 0,
+    }
+    
+    for pricing_name in ["Downside", "Base", "Upside"]:
+        panel_df = chart_df[chart_df["pricing_case"] == pricing_name].copy()
+        col_num = panel_col_map[pricing_name]
+    
+        for dc_case in ["Low", "Base", "High"]:
+            dc_df = panel_df[panel_df["dc_case"] == dc_case].copy()
+            if dc_df.empty:
+                continue
+    
+            marker_sizes = [size_map.get(float(x), 14) for x in dc_df["tc_risk"]]
+            show_legend = dc_case not in legend_seen
+    
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        b + tc_jitter.get(round(float(r), 2), 0)
+                        for b, r in zip(dc_df["bid"], dc_df["tc_risk"])
+                    ],                    
+                    y=dc_df["irr"],
+                    mode="markers",
+                    name=dc_label_map[dc_case],
+                    legendgroup="dc",
+                    showlegend=show_legend,
+                    marker=dict(
+                        color=color_map[dc_case],
+                        size=marker_sizes,
+                        line=dict(color="white", width=0.5),
+                        opacity=0.70,
+                    ),
+                    hovertemplate=(
+                        "Bid: $%{x:,.0f}"
+                        "<br>IRR: %{y:.1%}"
+                        "<br>D&C: " + dc_label_map[dc_case] +
+                        "<br>TC Risk: %{customdata[0]:.0%}"
+                        "<br>Oil: $%{customdata[1]:.0f}"
+                        "<br>Gas: $%{customdata[2]:.2f}"
+                        "<extra></extra>"
+                    ),
+                    customdata=dc_df[["tc_risk", "oil_price", "gas_price"]].values,
+                ),
+                row=1,
+                col=col_num,
+            )
+
+            legend_seen.add(dc_case)
+
+    base_tc_risk = round(weighted_avg_by_net_acres(slot_df, "tc_risk"), 2)
+    base_bid_rounded = round(float(base_bid), 2)
+    
+    base_points = chart_df[
+        (chart_df["pricing_case"] == "Base")
+        & (chart_df["dc_case"] == "Base")
+        & (chart_df["tc_risk"].round(2) == base_tc_risk)
+        & (chart_df["bid"].round(2) == base_bid_rounded)
+    ].copy()
+    
+    if base_points.empty:
+        base_points = chart_df[
+            (chart_df["pricing_case"] == "Base")
+            & (chart_df["dc_case"] == "Base")
+            & (chart_df["tc_risk"].round(2) == 1.00)
+            & (chart_df["bid"].round(2) == base_bid_rounded)
+        ].copy()
+    
+
+    if not base_points.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=base_points["bid"],
+                y=base_points["irr"],
+                mode="markers",
+                name="Current Base Point",
+                marker=dict(
+                    color="#1F4E79",
+                    size=24,
+                    line=dict(color="black", width=3),
+                    opacity=1.0,
+                ),
+                hovertemplate="Current Base Point<br>Bid: $%{x:,.0f}<br>IRR: %{y:.1%}<extra></extra>",
+            ),
+            row=1,
+            col=2,
+    )
+
+    for c in [1, 2, 3]:
+        fig.update_xaxes(
+            title_text="$/Acre Bid",
+            tickprefix="$",
+            tickformat=",.0f",
+            showgrid=False,
+            row=1,
+            col=c,
+        )
+
+    fig.update_yaxes(
+        title_text="IRR",
+        tickformat=".0%",
+        showgrid=True,
+        gridcolor="rgba(0,0,0,0.08)",
+        row=1,
+        col=1,
+    )
+
+    fig.update_layout(
+        title=dict(
+            text="Scenario Matrix: IRR vs. $/Acre Bid<br><sup>Color = D&C | Marker Size = TC Risk</sup>",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=26, color="black"),
+        ),
+        height=1000,
+        margin=dict(l=80, r=60, t=195, b=245),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.20,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=18, color="black"),   # 🔥 bigger legend
+            traceorder="normal",
+            entrywidth=200,                      # 🔥 slightly wider spacing
+            entrywidthmode="pixels",
+            tracegroupgap=28,
+        ),
+    )
+    
+    fig.update_xaxes(
+        tickfont=dict(size=18, color="black"),   # 🔥 bigger ticks
+        title_font=dict(size=20, color="black"), # 🔥 bigger label
+    )
+    
+    fig.update_yaxes(
+        tickfont=dict(size=16, color="black"),
+        title_font=dict(size=18, color="black"),
+    )
+
+    fig.add_annotation(
+        x=0.165, y=1.04,
+        xref="paper", yref="paper",
+        text=f"<b>Downside (Oil {pricing_cases[0][1]:.0f} / Gas {pricing_cases[0][2]:.2f})</b>",
+        showarrow=False,
+        font=dict(size=24, color="black"),
+        xanchor="center",
+        yanchor="bottom",
+    )
+    
+    fig.add_annotation(
+        x=0.50, y=1.04,
+        xref="paper", yref="paper",
+        text=f"<b>Base (Oil {pricing_cases[1][1]:.0f} / Gas {pricing_cases[1][2]:.2f})</b>",
+        showarrow=False,
+        font=dict(size=24, color="black"),
+        xanchor="center",
+        yanchor="bottom",
+    )
+    
+    fig.add_annotation(
+        x=0.835, y=1.04,
+        xref="paper", yref="paper",
+        text=f"<b>Upside (Oil {pricing_cases[2][1]:.0f} / Gas {pricing_cases[2][2]:.2f})</b>",
+        showarrow=False,
+        font=dict(size=24, color="black"),
+        xanchor="center",
+        yanchor="bottom",
+    )
+
+    # Centered custom TC Risk legend below the D&C legend.
+    fig.add_annotation(
+        x=0.50,
+        y=-0.285,
+        xref="paper",
+        yref="paper",
+        text=(
+            "<span style='font-size:14px; color:rgba(120,120,120,0.85);'>●</span>"
+            "&nbsp; TC Risk 80%"
+            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            "<span style='font-size:20px; color:rgba(120,120,120,0.85);'>●</span>"
+            "&nbsp; TC Risk 100%"
+            "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+            "<span style='font-size:30px; color:rgba(120,120,120,0.85);'>●</span>"
+            "&nbsp; TC Risk 120%"
+        ),
+        showarrow=False,
+        font=dict(size=18, color="black"),
+        xanchor="center",
+        yanchor="middle",
+        align="center",
+    )
+    
+    return fig
+
+def fig_to_base64_png(fig, width=1200, height=700, chart_name="Chart"):
+    try:
+        img_bytes = fig.to_image(
+            format="png",
+            width=width,
+            height=height,
+            scale=1,
+        )
+        return base64.b64encode(img_bytes).decode("utf-8")
+
+    except Exception as exc:
+        st.session_state["email_chart_export_error"] = (
+            f"{chart_name} export error: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def html_img_from_fig(fig, width=900, height=500, title="Chart", max_width_px=None):
+    if fig is None:
+        return f"""
+        <div style="margin:12px 0 20px 0; padding:12px; border:1px solid #cccccc;">
+            <b>{title}</b><br>Not generated for this model run.
+        </div>
+        """
+
+    img_b64 = fig_to_base64_png(
+        fig,
+        width=width,
+        height=height,
+        chart_name=title,
+    )
+
+    if img_b64 is None:
+        return f"""
+        <div style="margin:12px 0 20px 0; padding:12px; border:1px solid #cccccc;">
+            <b>{title}</b><br>
+            {st.session_state.get(
+                "email_chart_export_error",
+                "Image export unavailable in current environment.",
+            )}
+        </div>
+        """
+
+    max_width_style = f"max-width:{max_width_px}px;" if max_width_px else f"max-width:{width}px;"
+
+    return f'''
+        <img src="data:image/png;base64,{img_b64}"
+             style="width:100%; {max_width_style} height:auto; margin:12px 0 20px 0; display:block;">
+    '''
+
+def build_email_html(
+    opportunity_name,
+    deal_inputs,
+    slot_df,
+    irr,
+    moic,
+    tc_output_styler,
+    quarterly_output_styler,
+    irr_oil_bid_heatmap,
+    irr_gas_bid_heatmap,
+    irr_oil_gas_heatmap,
+    irr_gas_dc_heatmap,
+    irr_heatmap,
+    irr_tcrisk_bid_heatmap,
+    irr_ngl_yield_bid_heatmap,
+    irr_spud_tcrisk_heatmap,
+    cum_fcf_chart,
+    prod_chart_stacked,
+    scenario_scatter_chart,
+):
+    base_gas = float(deal_inputs["gas_price"])
+    base_oil = float(deal_inputs["oil_price"])
 
     pricing_mode = str(
         deal_inputs.get("pricing_mode", "flat")
     ).lower()
-
-    if pricing_mode not in {"flat", "file"}:
-        raise ValueError(
-            f"Unsupported pricing mode: {pricing_mode}"
+    
+    if pricing_mode == "file":
+        oil_switch_date = pd.Timestamp(
+            deal_inputs["oil_flat_start_date"]
         )
-
-    return {
-        "pricing_mode": pricing_mode,
-
-        "pricing_file_path": str(
-            deal_inputs.get(
-                "pricing_file_path",
-                "price_file_library.xlsx",
-            )
-        ),
-
-        # In flat mode, these are the flat prices.
-        # In file mode, these are the terminal flat prices.
-        "oil_price": float(deal_inputs["oil_price"]),
-        "gas_price": float(deal_inputs["gas_price"]),
-
-        # These retain the original base-case values during sensitivities.
-        "base_oil_price": float(
-            deal_inputs.get(
-                "base_oil_price",
-                deal_inputs["oil_price"],
-            )
-        ),
-
-        "base_gas_price": float(
-            deal_inputs.get(
-                "base_gas_price",
-                deal_inputs["gas_price"],
-            )
-        ),
-
-        "oil_flat_start_date": pd.to_datetime(
-            deal_inputs.get(
-                "oil_flat_start_date",
-                "1900-01-01",
-            )
-        ),
-
-        "gas_flat_start_date": pd.to_datetime(
-            deal_inputs.get(
-                "gas_flat_start_date",
-                "1900-01-01",
-            )
-        ),
-
-        "use_sev_tax_pct": use_sev_tax_pct,
-
-        # In percentage mode, the app accepts whole percentages:
-        # 5 = 5%, so convert it to 0.05 for the calculation.
-        "oil_sev_tax": (
-            float(deal_inputs["oil_sev_tax"]) / 100.0
-            if use_sev_tax_pct
-            else float(deal_inputs["oil_sev_tax"])
-        ),
-
-        "gas_sev_tax": (
-            float(deal_inputs["gas_sev_tax"]) / 100.0
-            if use_sev_tax_pct
-            else float(deal_inputs["gas_sev_tax"])
-        ),
-
-        "ad_val_tax": float(deal_inputs["ad_val_tax"]),
-        "ethane_rec": 1 if bool(deal_inputs["ethane_rec"]) else 0,
-        "content_percentages": {
-            "ethane": float(deal_inputs["content_ethane"]),
-            "propane": float(deal_inputs["content_propane"]),
-            "isobutane": float(deal_inputs["content_isobutane"]),
-            "butane": float(deal_inputs["content_butane"]),
-            "pentanes": float(deal_inputs["content_pentanes"]),
-        },
-        "recover_ethane_percentages": {
-            "ethane": float(deal_inputs["rec_ethane"]),
-            "propane": float(deal_inputs["rec_propane"]),
-            "isobutane": float(deal_inputs["rec_isobutane"]),
-            "butane": float(deal_inputs["rec_butane"]),
-            "pentanes": float(deal_inputs["rec_pentanes"]),
-        },
-        "reject_ethane_percentages": {
-            "ethane": float(deal_inputs["rej_ethane"]),
-            "propane": float(deal_inputs["rej_propane"]),
-            "isobutane": float(deal_inputs["rej_isobutane"]),
-            "butane": float(deal_inputs["rej_butane"]),
-            "pentanes": float(deal_inputs["rej_pentanes"]),
-        },
-        "ngl_prices": {
-            "ethane": float(deal_inputs["price_ethane"]),
-            "propane": float(deal_inputs["price_propane"]),
-            "isobutane": float(deal_inputs["price_isobutane"]),
-            "butane": float(deal_inputs["price_butane"]),
-            "pentanes": float(deal_inputs["price_pentanes"]),
-        },
-        "ngl_shrink_factors": {
-            "ethane": float(deal_inputs["shrink_ethane"]),
-            "propane": float(deal_inputs["shrink_propane"]),
-            "isobutane": float(deal_inputs["shrink_isobutane"]),
-            "butane": float(deal_inputs["shrink_butane"]),
-            "pentanes": float(deal_inputs["shrink_pentanes"]),
-        },
-    }
-
-
-
-def prepare_slot_inputs(slot_df, deal_inputs):
-    df = slot_df.copy()
-
-    required_defaults = {
-        "slot_id": 0,
-        "dale_promote": False,
-        "dale_unit_id": "",
-        "dale_payout_group": "",
-        "dale_first_well_carry": False,
-        "carry_enabled": False,
-        "carry_wi_reversion_pct": 0.0,
-        "use_calc_unit_acres": False,
-        "flowback_delay": 4,
-        "tc_risk": 1.0,
-        "oil_diff": 0.0,
-        "gas_diff": 0.0,
-        "ngl_diff": 0.0,
-        "oil_opex_bbl": 0.0,
-        "gas_opex_mcf": 0.0,
-        "ngl_opex": 0.0,
-        "fixed_loe": 0.0,
-        "ngl_yield": 0.0,
-    }
-
-    for col, default in required_defaults.items():
-        if col not in df.columns:
-            df[col] = default
-        df[col] = df[col].fillna(default)
-
-    if "drilling_spud_month" in df.columns:
-        df["drilling_spud_month"] = pd.to_datetime(df["drilling_spud_month"])
+    
+        gas_switch_date = pd.Timestamp(
+            deal_inputs["gas_flat_start_date"]
+        )
+    
+        pricing_summary = (
+            "Monthly pricing deck, with oil transitioning to "
+            f"${base_oil:,.2f}/Bbl beginning "
+            f"{oil_switch_date:%B %Y} and gas transitioning to "
+            f"${base_gas:,.3f}/Mcf beginning "
+            f"{gas_switch_date:%B %Y}"
+        )
+    
     else:
-        df["drilling_spud_month"] = pd.Timestamp(default_effective_date())
-
-    if bool(deal_inputs.get("use_dc_override", False)):
-        df["dc_costs"] = float(deal_inputs.get("dc_override", 0.0))
-    else:
-        df["dc_costs"] = df["dc_costs"].astype(float)
-
-    if bool(deal_inputs.get("use_bid_override", False)):
-        df["bid_per_acre"] = max(
-            1.0,
-            float(deal_inputs.get("bid_override", 1.0)),
-        )
-    else:
-        df["bid_per_acre"] = (
-            pd.to_numeric(df["bid_per_acre"], errors="coerce")
-            .fillna(1.0)
-            .clip(lower=1.0)
+        pricing_summary = (
+            f"${base_oil:,.2f}/Bbl oil and "
+            f"${base_gas:,.3f}/Mcf gas"
         )
 
-    # Deal-level carry override. This is intentionally applied before the
-    # whole-percent carry input is converted to a decimal below, so entering
-    # 20 here is exactly the same as entering 20 in every slot's carry field.
-    if bool(deal_inputs.get("use_carry_override", False)):
-        df["carry_enabled"] = True
-        df["carry_wi_reversion_pct"] = float(
-            deal_inputs.get("carry_override_pct", 0.0)
+    base_dc = (
+        float(deal_inputs["dc_override"])
+        if deal_inputs["use_dc_override"]
+        else weighted_avg_by_net_acres(slot_df, "dc_costs")
+    )
+    
+    base_bid = max(
+        1.0,
+        (
+            float(deal_inputs["bid_override"])
+            if deal_inputs["use_bid_override"]
+            else weighted_avg_by_net_acres(slot_df, "bid_per_acre")
+        ),
+    )
+    
+    total_wells = float(slot_df["gross_wells"].sum())
+    avg_ll = weighted_avg_by_net_acres(slot_df, "lateral_length")
+    avg_pct_unitized = weighted_avg_by_net_acres(slot_df, "pct_unitized")
+    avg_tc_risk = weighted_avg_by_net_acres(slot_df, "tc_risk")
+
+    tc_names = slot_df["tc_name"].dropna().astype(str).unique().tolist()
+    tc_name_text = ", ".join(tc_names)
+
+    tc_table_html = tc_output_styler.to_html()
+    quarterly_table_html = quarterly_output_styler.to_html()
+
+    sensitivities_html = f"""
+    <h3 style='margin-bottom:8px;'>Sensitivities:</h3>
+    
+    <table role="presentation" style="width:auto; border-collapse:collapse; margin:0 0 20px 0;">
+        <tr>
+            <td style="vertical-align:top; padding:0 8px 12px 8px;">
+                {html_img_from_fig(
+                    irr_oil_bid_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Oil Price IRR",
+                    max_width_px=760,
+                )}
+            </td>
+            <td style="vertical-align:top; padding:0 8px 12px 8px;">
+                {html_img_from_fig(
+                    irr_gas_bid_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Gas Price IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+        <tr>
+            <td
+                colspan="2"
+                style="
+                    vertical-align:top;
+                    padding:12px 8px 0 8px;
+                    text-align:center;
+                "
+            >
+                {html_img_from_fig(
+                    irr_gas_dc_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Gas Price vs. D&C Costs IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+        <tr>
+            <td style="vertical-align:top; padding:0 8px 12px 8px;">
+                {html_img_from_fig(
+                    irr_heatmap,
+                    width=1100,
+                    height=450,
+                    title="D&C Costs IRR",
+                    max_width_px=760,
+                )}
+            </td>
+            <td style="vertical-align:top; padding:0 8px 12px 8px;">
+                {html_img_from_fig(
+                    irr_tcrisk_bid_heatmap,
+                    width=1100,
+                    height=450,
+                    title="TC Risk IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+        <tr>
+            <td style="vertical-align:top; padding:0 8px 0 8px;">
+                {html_img_from_fig(
+                    irr_ngl_yield_bid_heatmap,
+                    width=1100,
+                    height=450,
+                    title="NGL Yield IRR",
+                    max_width_px=760,
+                )}
+            </td>
+            <td style="vertical-align:top; padding:0 8px 0 8px;">
+                {html_img_from_fig(
+                    irr_spud_tcrisk_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Spud Date vs. TC Risk IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+        <tr>
+            <td
+                colspan="2"
+                style="
+                    vertical-align:top;
+                    padding:12px 8px 0 8px;
+                    text-align:center;
+                "
+            >
+                {html_img_from_fig(
+                    irr_oil_gas_heatmap,
+                    width=1100,
+                    height=450,
+                    title="Oil Price vs. Gas Price IRR",
+                    max_width_px=760,
+                )}
+            </td>
+        </tr>
+    </table>
+    """
+    
+    charts_html = "".join([
+        "<h3 style='margin-bottom:8px;'>Charts:</h3>",
+        html_img_from_fig(
+            cum_fcf_chart,
+            width=950,
+            height=450,
+            title="Cumulative FCF",
+            max_width_px=950,
+        ),
+        html_img_from_fig(prod_chart_stacked, width=1100, height=520, title="Production in BOE/d"),
+        html_img_from_fig(
+            scenario_scatter_chart,
+            width=2600,
+            height=1100,
+            max_width_px=1800,
+        )
+    ])
+
+    html = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #000000; line-height: 1.45;">
+        <p>Utica Team,</p>
+    
+        <p>Below are our contemplated economics for the {opportunity_name} opportunity.</p>
+    
+        <p><b>Base Case Summary:</b></p>
+        <ul style="margin-top:0;">
+            <li>
+                Pricing: {pricing_summary}
+            </li>
+            <li>
+                D&amp;C Costs: ${base_dc:,.0f}/ft
+            </li>
+            <li>
+                Type Curves: {tc_name_text}{"s" if len(tc_names) > 1 else ""}; {avg_tc_risk:.0%} base case TC risk
+            </li>
+            <li>
+                Development: {total_wells:,.1f} gross wells with ~{avg_ll:,.0f}' average lateral length
+            </li>
+            <li>
+                Unitization: {avg_pct_unitized:.0%} of acres assumed to be unitized
+            </li>
+            <li>
+                Entry: ${base_bid:,.0f}/acre
+            </li>
+            <li>
+                Returns: <b>{irr:.1%} IRR</b> and <b>{moic:.2f}x MOIC</b>
+            </li>
+        </ul>
+    
+        <p>Let us know if you have any questions.</p>
+    
+        <h3 style="margin-bottom:8px;">Type Curve Assumptions:</h3>
+        {tc_table_html}
+    
+        <h3 style="margin-top:24px; margin-bottom:8px;">Quarterly Output:</h3>
+        {quarterly_table_html}
+    
+        <div style="margin-top:24px;">
+            {sensitivities_html}
+        </div>
+    
+        <div style="margin-top:24px;">
+            {charts_html}
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+# -----------------------------
+# Session state init
+# -----------------------------
+# Bump this value whenever the editor schema or stored model-result schema
+# changes. Streamlit can retain old widget/session values across a hot reload,
+# which may leave the page blank or stuck after a deployment.
+APP_STATE_VERSION = "carry-sensitivity-v1"
+
+if st.session_state.get("_app_state_version") != APP_STATE_VERSION:
+    # Clear stale data-editor widget state and prior calculated outputs.
+    # Preserve the user's slot table when possible, but sanitize the new
+    # $1/acre minimum before the editor renders.
+    existing_slot_df = st.session_state.get("slot_df")
+
+    for stale_key in [
+        "slot_editor",
+        "slot_editor_v2",
+    
+        # Pricing widgets
+        "use_monthly_pricing_file",
+        "flat_mode_oil_price",
+        "flat_mode_gas_price",
+        "oil_flat_start_date",
+        "gas_flat_start_date",
+        "terminal_oil_price",
+        "terminal_gas_price",
+    
+        "model_deal_inputs",
+        "deal_df",
+        "all_slots_df",
+        "model_slot_df",
+        "slot_audit_df",
+        "deal_audit_df",
+        "irr",
+        "moic",
+        "deal_log_overview_df",
+        "deal_log_slot_df",
+        "deal_log_filename",
+        "base_input_signature",
+        "sensitivity_results",
+        "base_charts",
+        "base_charts_signature",
+        "email_html",
+        "email_html_signature",
+        "email_html_opportunity_name",
+        "audit_excel_data",
+    ]:
+        st.session_state.pop(stale_key, None)
+
+    if isinstance(existing_slot_df, pd.DataFrame):
+        existing_slot_df = existing_slot_df.copy()
+        if "bid_per_acre" in existing_slot_df.columns:
+            existing_slot_df["bid_per_acre"] = (
+                pd.to_numeric(
+                    existing_slot_df["bid_per_acre"],
+                    errors="coerce",
+                )
+                .fillna(1.0)
+                .clip(lower=1.0)
+            )
+        st.session_state["slot_df"] = existing_slot_df
+
+    st.session_state["model_has_run"] = False
+    st.session_state["_app_state_version"] = APP_STATE_VERSION
+if "slot_df" not in st.session_state:
+    st.session_state["slot_df"] = build_slot_template(2)
+
+if "include_slot" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"].insert(0, "include_slot", True)
+    
+if "dale_promote" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"].insert(1, "dale_promote", False)
+
+if "dale_unit_id" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"]["dale_unit_id"] = [
+        f"UNIT-{int(slot_id)}"
+        for slot_id in st.session_state["slot_df"]["slot_id"]
+    ]
+
+if "dale_payout_group" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"]["dale_payout_group"] = st.session_state[
+        "slot_df"
+    ]["dale_unit_id"]
+
+if "dale_first_well_carry" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"]["dale_first_well_carry"] = False
+
+if "carry_enabled" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"].insert(2, "carry_enabled", False)
+
+if "carry_dnc_pct" in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"] = st.session_state["slot_df"].drop(
+        columns=["carry_dnc_pct"]
+    )
+
+if "carry_wi_reversion_pct" not in st.session_state["slot_df"].columns:
+    st.session_state["slot_df"]["carry_wi_reversion_pct"] = 0.0
+
+if "model_deal_inputs" not in st.session_state:
+    st.session_state["model_deal_inputs"] = None
+
+if "deal_df" not in st.session_state:
+    st.session_state["deal_df"] = None
+
+if "all_slots_df" not in st.session_state:
+    st.session_state["all_slots_df"] = None
+
+if "model_slot_df" not in st.session_state:
+    st.session_state["model_slot_df"] = None
+
+if "irr" not in st.session_state:
+    st.session_state["irr"] = None
+
+if "moic" not in st.session_state:
+    st.session_state["moic"] = None
+
+if "model_has_run" not in st.session_state:
+    st.session_state["model_has_run"] = False
+
+# If the app has old results from before model_slot_df existed,
+# force the user to rerun the model instead of trying to copy None.
+if st.session_state["model_has_run"] and st.session_state["model_slot_df"] is None:
+    st.session_state["model_has_run"] = False
+    st.session_state["deal_df"] = None
+    st.session_state["all_slots_df"] = None
+
+if "heavy_outputs_disabled" not in st.session_state:
+    st.session_state["heavy_outputs_disabled"] = False
+
+if "base_input_signature" not in st.session_state:
+    st.session_state["base_input_signature"] = None
+
+if "audit_excel_data" not in st.session_state:
+    st.session_state["audit_excel_data"] = None
+
+if "sensitivity_results" not in st.session_state:
+    st.session_state["sensitivity_results"] = {}
+
+if "base_charts" not in st.session_state:
+    st.session_state["base_charts"] = {}
+
+if "base_charts_signature" not in st.session_state:
+    st.session_state["base_charts_signature"] = None
+
+if "use_tc_risk_as_main_sensitivity" not in st.session_state:
+    st.session_state["use_tc_risk_as_main_sensitivity"] = False
+
+if "use_dc_pct_sensitivity" not in st.session_state:
+    st.session_state["use_dc_pct_sensitivity"] = False
+
+# -----------------------------
+# Sidebar deal inputs
+# -----------------------------
+st.sidebar.header("Deal-Level Inputs")
+
+st.sidebar.subheader("Output Mode")
+
+heavy_outputs_label = (
+    "Enable Sensitivities / Charts / Email"
+    if st.session_state["heavy_outputs_disabled"]
+    else "Disable Sensitivities / Charts / Email"
+)
+
+if st.sidebar.button(
+    heavy_outputs_label,
+    use_container_width=True,
+    type="secondary",
+):
+    st.session_state["heavy_outputs_disabled"] = not st.session_state["heavy_outputs_disabled"]
+    st.rerun()
+
+disable_heavy_outputs = st.session_state["heavy_outputs_disabled"]
+
+if disable_heavy_outputs:
+    st.sidebar.info(
+        "Fast output mode is on. Sensitivities, charts, and email export are disabled."
+    )
+
+# Sensitivity-only controls are rendered beside the sensitivity dropdowns
+# after the base model has run. Their current values are retained here so
+# they are available while the deal-input dictionary is assembled.
+use_tc_risk_as_main_sensitivity = bool(
+    st.session_state.get("use_tc_risk_as_main_sensitivity", False)
+)
+use_dc_pct_sensitivity = bool(
+    st.session_state.get("use_dc_pct_sensitivity", False)
+)
+
+st.sidebar.subheader("Timing")
+effective_date = st.sidebar.date_input("Effective Date", value=next_month_start())
+
+st.sidebar.subheader("Pricing")
+
+use_monthly_pricing_file = st.sidebar.toggle(
+    "Use Monthly Pricing File",
+    value=True,
+    key="use_monthly_pricing_file",
+    help=(
+        "Off = use flat oil and gas prices for the entire model. "
+        "On = use price_file_library.xlsx until each commodity's "
+        "selected flat-pricing date."
+    ),
+)
+
+pricing_mode = (
+    "file"
+    if use_monthly_pricing_file
+    else "flat"
+)
+
+if pricing_mode == "flat":
+    oil_col, gas_col = st.sidebar.columns(2)
+
+    with oil_col:
+        oil_price = st.number_input(
+            "Oil Price ($/bbl)",
+            min_value=0.0,
+            value=70.0,
+            step=1.0,
+            format="%.2f",
+            key="flat_mode_oil_price",
         )
 
-    numeric_cols = [
-        "slot_id",
+    with gas_col:
+        gas_price = st.number_input(
+            "Gas Price ($/mcf)",
+            min_value=0.0,
+            value=3.75,
+            step=0.05,
+            format="%.3f",
+            key="flat_mode_gas_price",
+        )
+
+    # These dates are ignored in flat mode.
+    oil_flat_start_date = date(1900, 1, 1)
+    gas_flat_start_date = date(1900, 1, 1)
+
+else:
+    try:
+        pricing_preview_df = load_price_file(
+            PRICE_FILE_PATH
+        )
+
+    except (FileNotFoundError, ValueError) as error:
+        st.sidebar.error(str(error))
+        st.stop()
+
+    first_pricing_month = (
+        pricing_preview_df["month"].min()
+    )
+
+    last_pricing_month = (
+        pricing_preview_df["month"].max()
+    )
+
+    # The transition month can be no later than the first month after the
+    # final month included in the monthly pricing file.
+    latest_allowed_flat_start = (
+        last_pricing_month
+        + pd.offsets.MonthBegin(1)
+    ).date()
+
+    requested_default_flat_start = (
+        default_flat_start_date()
+    )
+
+    # Use the true 48-month default whenever the pricing file extends far
+    # enough. Otherwise, use the latest valid transition month.
+    default_flat_start = min(
+        requested_default_flat_start,
+        latest_allowed_flat_start,
+    )
+
+    st.sidebar.caption(
+        "Pricing file range: "
+        f"{first_pricing_month:%b %Y} through "
+        f"{last_pricing_month:%b %Y}"
+    )
+
+    if requested_default_flat_start > latest_allowed_flat_start:
+        st.sidebar.warning(
+            "The pricing file does not extend through the default "
+            "48-month period. The switch to flat pricing has been "
+            "limited to "
+            f"{latest_allowed_flat_start:%B 1, %Y}."
+        )
+
+    oil_col, gas_col = st.sidebar.columns(2)
+
+    with oil_col:
+        st.markdown("**Oil**")
+
+        oil_flat_start_date = st.date_input(
+            "Switch to Flat",
+            value=default_flat_start,
+            max_value=latest_allowed_flat_start,
+            format="MM/DD/YYYY",
+            key="oil_flat_start_date",
+            help=(
+                "The selected month uses the flat price. "
+                "The pricing file is used only for earlier months."
+            ),
+        )
+
+        oil_price = st.number_input(
+            "Flat Oil ($/bbl)",
+            min_value=0.0,
+            value=70.0,
+            step=1.0,
+            format="%.2f",
+            key="terminal_oil_price",
+        )
+
+    with gas_col:
+        st.markdown("**Gas**")
+
+        gas_flat_start_date = st.date_input(
+            "Switch to Flat",
+            value=default_flat_start,
+            max_value=latest_allowed_flat_start,
+            format="MM/DD/YYYY",
+            key="gas_flat_start_date",
+            help=(
+                "The selected month uses the flat price. "
+                "The pricing file is used only for earlier months."
+            ),
+        )
+
+        gas_price = st.number_input(
+            "Flat Gas ($/mcf)",
+            min_value=0.0,
+            value=3.75,
+            step=0.05,
+            format="%.3f",
+            key="terminal_gas_price",
+        )
+
+    # Normalize the selected dates to the first day of each month.
+    oil_flat_start_date = (
+        pd.Timestamp(oil_flat_start_date)
+        .to_period("M")
+        .to_timestamp()
+        .date()
+    )
+
+    gas_flat_start_date = (
+        pd.Timestamp(gas_flat_start_date)
+        .to_period("M")
+        .to_timestamp()
+        .date()
+    )
+
+st.sidebar.subheader("Overrides")
+
+use_acquisition_override = st.sidebar.checkbox("Use Acquisition Cost Override", value=False)
+acquisition_cost_override = st.sidebar.number_input(
+    "Acquisition Cost Override",
+    min_value=0.0,
+    value=0.0,
+    step=1000.0,
+    format="%.1f",
+    disabled=not use_acquisition_override,
+)
+
+use_dc_override = st.sidebar.checkbox("Use D&C Override for All Slots", value=False)
+dc_override = st.sidebar.number_input(
+    "D&C Override ($/ft)",
+    value=750.0,
+    step=25.0,
+    disabled=not use_dc_override,
+)
+
+use_bid_override = st.sidebar.checkbox("Use $/Acre Override for All Slots", value=False)
+bid_override = st.sidebar.number_input(
+    "$/Acre Override",
+    min_value=1.0,
+    value=8000.0,
+    step=250.0,
+    disabled=not use_bid_override,
+)
+
+use_carry_override = st.sidebar.checkbox(
+    "Use Carry Override for All Slots",
+    value=False,
+    help=(
+        "When enabled, every included slot is treated as carry-enabled and "
+        "uses the same carry percentage. This is the same as entering that "
+        "carry percentage into every individual slot."
+    ),
+)
+carry_override_pct = st.sidebar.number_input(
+    "Carry Override (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=20.0,
+    step=1.0,
+    format="%.1f",
+    disabled=not use_carry_override,
+)
+
+st.sidebar.subheader("Taxes")
+
+use_sev_tax_pct = st.sidebar.toggle(
+    "Severance Tax as % of Net Revenue",
+    value=False,
+    help=(
+        "Off = fixed $/bbl for oil and $/mcf for gas. "
+        "On = percentage of net oil revenue and net gas revenue."
+    ),
+)
+
+oil_tax_col, gas_tax_col = st.sidebar.columns(2)
+
+if use_sev_tax_pct:
+    with oil_tax_col:
+        oil_sev_tax = st.number_input(
+            "Oil Sev. Tax (%)",
+            min_value=0.0,
+            value=0.0,
+            step=0.25,
+            format="%.3f",
+            key="oil_sev_tax_pct_input",
+            help="Enter 5 for 5% of net oil revenue.",
+        )
+
+    with gas_tax_col:
+        gas_sev_tax = st.number_input(
+            "Gas Sev. Tax (%)",
+            min_value=0.0,
+            value=0.0,
+            step=0.25,
+            format="%.3f",
+            key="gas_sev_tax_pct_input",
+            help="Enter 5 for 5% of net gas revenue.",
+        )
+
+else:
+    with oil_tax_col:
+        oil_sev_tax = st.number_input(
+            "Oil Sev. Tax ($/bbl)",
+            min_value=0.0,
+            value=0.10,
+            step=0.01,
+            format="%.3f",
+            key="oil_sev_tax_fixed_input",
+        )
+
+    with gas_tax_col:
+        gas_sev_tax = st.number_input(
+            "Gas Sev. Tax ($/mcf)",
+            min_value=0.0,
+            value=0.025,
+            step=0.005,
+            format="%.3f",
+            key="gas_sev_tax_fixed_input",
+        )
+
+ad_val_tax = st.sidebar.number_input(
+    "Ad Valorem Tax (% of Net Revenue)",
+    value=0.025,
+    step=0.005,
+    format="%.3f",
+)
+
+st.sidebar.subheader("Ethane / NGL")
+ethane_rec = st.sidebar.checkbox("Recover Ethane", value=False)
+
+with st.sidebar.expander("Content Percentages", expanded=False):
+    content_ethane = st.number_input("Ethane Content %", value=0.50, step=0.01, format="%.3f")
+    content_propane = st.number_input("Propane Content %", value=0.25, step=0.01, format="%.3f")
+    content_isobutane = st.number_input("Isobutane Content %", value=0.065, step=0.005, format="%.3f")
+    content_butane = st.number_input("Butane Content %", value=0.065, step=0.005, format="%.3f")
+    content_pentanes = st.number_input("Pentanes Content %", value=0.12, step=0.01, format="%.3f")
+
+with st.sidebar.expander("Recover Ethane Percentages", expanded=False):
+    rec_ethane = st.number_input("Recover Ethane %", value=0.90, step=0.01, format="%.3f")
+    rec_propane = st.number_input("Recover Propane %", value=0.98, step=0.01, format="%.3f")
+    rec_isobutane = st.number_input("Recover Isobutane %", value=0.99, step=0.01, format="%.3f")
+    rec_butane = st.number_input("Recover Butane %", value=0.99, step=0.01, format="%.3f")
+    rec_pentanes = st.number_input("Recover Pentanes %", value=0.995, step=0.001, format="%.3f")
+
+with st.sidebar.expander("Reject Ethane Percentages", expanded=False):
+    rej_ethane = st.number_input("Reject Ethane %", value=0.20, step=0.01, format="%.3f")
+    rej_propane = st.number_input("Reject Propane %", value=0.90, step=0.01, format="%.3f")
+    rej_isobutane = st.number_input("Reject Isobutane %", value=0.98, step=0.01, format="%.3f")
+    rej_butane = st.number_input("Reject Butane %", value=0.98, step=0.01, format="%.3f")
+    rej_pentanes = st.number_input("Reject Pentanes %", value=0.995, step=0.001, format="%.3f")
+
+with st.sidebar.expander("NGL Shrink Factors", expanded=False):
+    shrink_ethane = st.number_input("Ethane Shrink", value=0.06634, step=0.001, format="%.5f")
+    shrink_propane = st.number_input("Propane Shrink", value=0.091563, step=0.001, format="%.5f")
+    shrink_isobutane = st.number_input("Isobutane Shrink", value=0.09963, step=0.001, format="%.5f")
+    shrink_butane = st.number_input("Butane Shrink", value=0.103744, step=0.001, format="%.5f")
+    shrink_pentanes = st.number_input("Pentanes Shrink", value=0.10968, step=0.001, format="%.5f")
+
+with st.sidebar.expander("NGL Component Prices", expanded=False):
+    price_ethane = st.number_input("Ethane Price", value=0.23450, step=0.01, format="%.5f")
+    price_propane = st.number_input("Propane Price", value=0.82528, step=0.01, format="%.5f")
+    price_isobutane = st.number_input("Isobutane Price", value=0.76020, step=0.01, format="%.5f")
+    price_butane = st.number_input("Butane Price", value=0.61473, step=0.01, format="%.5f")
+    price_pentanes = st.number_input("Pentanes Price", value=1.28987, step=0.01, format="%.5f")
+
+st.sidebar.subheader("Dale Promote / WI Reversion")
+
+st.sidebar.caption(
+    "Each Dale payout group earns its own reversion using positive OCF after "
+    "LOE and taxes. The OCF test uses the combined USEDC + Granite interest "
+    "before the Granite carry split. The additional WI is then taken "
+    "proportionately from each party's then-current WI."
+)
+
+st.sidebar.caption(
+    "Model basis: slot WI / net acres represent the original pre-Dale WI. "
+    "Dale's initial interest is deducted first, and the remaining WI is then "
+    "split between USEDC and Granite under the carry arrangement."
+)
+
+dale_promote_override = st.sidebar.checkbox(
+    "Dale Override - Apply to All Slots",
+    value=False,
+)
+
+dale_initial_interest_pct = st.sidebar.number_input(
+    "Initial Dale Lease Interest (%)",
+    min_value=0.0,
+    max_value=99.0,
+    value=6.25,
+    step=0.25,
+    format="%.2f",
+    help=(
+        "Dale's initial carried lease interest taken directly from the slot's "
+        "original pre-Dale WI. At 6.25%, Dale receives 6.25% of original WI."
+    ),
+)
+
+promote_wi_reversion_pct = st.sidebar.number_input(
+    "Additional WI Given Up at Payout (%)",
+    min_value=0.0,
+    max_value=100.0,
+    value=6.25,
+    step=0.25,
+    format="%.2f",
+    help=(
+        "The percentage taken from USEDC's and Granite's respective "
+        "then-current WI after the payout hurdle is reached."
+    ),
+)
+
+promote_multiple = st.sidebar.number_input(
+    "Dale Payout Multiple",
+    min_value=0.01,
+    value=1.00,
+    step=0.05,
+    format="%.2f",
+    help=(
+        "Cumulative positive OCF after LOE and taxes divided by acquisition "
+        "cost plus all funded D&C, including flagged Dale first-well carry costs, "
+        "calculated separately for each payout group."
+    ),
+)
+
+deal_inputs = {
+    "use_acquisition_override": use_acquisition_override,
+    "acquisition_cost_override": acquisition_cost_override,
+    "effective_date": effective_date,
+    "pricing_mode": pricing_mode,
+    "pricing_file_path": PRICE_FILE_PATH,
+
+    # Flat prices in flat mode.
+    # Terminal flat prices in file mode.
+    "oil_price": float(oil_price),
+    "gas_price": float(gas_price),
+
+    # Preserve the original base case for pricing sensitivities.
+    "base_oil_price": float(oil_price),
+    "base_gas_price": float(gas_price),
+
+    "oil_flat_start_date": oil_flat_start_date,
+    "gas_flat_start_date": gas_flat_start_date,
+    "use_dc_override": use_dc_override,
+    "dc_override": dc_override,
+    "use_bid_override": use_bid_override,
+    "bid_override": bid_override,
+    "use_carry_override": use_carry_override,
+    "carry_override_pct": carry_override_pct,
+    "use_tc_risk_as_main_sensitivity": use_tc_risk_as_main_sensitivity,
+    "use_dc_pct_sensitivity": use_dc_pct_sensitivity,
+    "use_sev_tax_pct": use_sev_tax_pct,
+    "oil_sev_tax": oil_sev_tax,
+    "gas_sev_tax": gas_sev_tax,
+    "ad_val_tax": ad_val_tax,
+    "ethane_rec": ethane_rec,
+    "content_ethane": content_ethane,
+    "content_propane": content_propane,
+    "content_isobutane": content_isobutane,
+    "content_butane": content_butane,
+    "content_pentanes": content_pentanes,
+    "rec_ethane": rec_ethane,
+    "rec_propane": rec_propane,
+    "rec_isobutane": rec_isobutane,
+    "rec_butane": rec_butane,
+    "rec_pentanes": rec_pentanes,
+    "rej_ethane": rej_ethane,
+    "rej_propane": rej_propane,
+    "rej_isobutane": rej_isobutane,
+    "rej_butane": rej_butane,
+    "rej_pentanes": rej_pentanes,
+    "shrink_ethane": shrink_ethane,
+    "shrink_propane": shrink_propane,
+    "shrink_isobutane": shrink_isobutane,
+    "shrink_butane": shrink_butane,
+    "shrink_pentanes": shrink_pentanes,
+    "price_ethane": price_ethane,
+    "price_propane": price_propane,
+    "price_isobutane": price_isobutane,
+    "price_butane": price_butane,
+    "price_pentanes": price_pentanes,
+    "dale_promote_override": dale_promote_override,
+    "dale_initial_interest_pct": dale_initial_interest_pct,
+    "promote_enabled": False,  # set right before model run based on selected slots
+    "promote_wi_reversion_pct": promote_wi_reversion_pct,
+    "promote_multiple": promote_multiple,
+}
+
+
+# -----------------------------
+# Slot controls
+# -----------------------------
+st.subheader("Type Curve Assumptions")
+
+file_mtime = os.path.getmtime("type_curve_library.xlsx")
+tc_names = ["Choose TC"] + load_tc_names(file_mtime)
+
+# Keep the slot-count controls in the same form as the editor.
+# This lets "Load Slots" receive unsaved changes currently in the grid.
+with st.form("slot_inputs_form"):
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    with col1:
+        num_slots = st.number_input(
+            "Number of Slots",
+            min_value=1,
+            step=1,
+            value=len(st.session_state["slot_df"]),
+        )
+
+    with col2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        load_slots_clicked = st.form_submit_button(
+            "Load Slots",
+            use_container_width=True,
+            type="primary",
+        )
+
+    with col3:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        refresh_tc_clicked = st.form_submit_button(
+            "Refresh Type Curves",
+            use_container_width=True,
+            type="secondary",
+        )
+        
+    edited_slot_df = st.data_editor(
+    st.session_state["slot_df"],
+    num_rows="fixed",
+    use_container_width=True,
+    key="slot_editor_v2",
+    column_order=[
+        "include_slot",
+        "dale_promote",
+        "dale_unit_id",
+        "dale_payout_group",
+        "dale_first_well_carry",
+        "carry_enabled",
         "carry_wi_reversion_pct",
-        "lateral_length",
+        "slot_id",
+        "tc_name",
         "gross_wells",
         "net_acres",
         "unit_acres",
+        "use_calc_unit_acres",
         "pct_unitized",
+        "drilling_spud_month",
         "flowback_delay",
         "net_revenue_interest",
+        "lateral_length",
         "dc_costs",
         "tc_risk",
         "bid_per_acre",
         "oil_diff",
         "gas_diff",
-        "ngl_diff",
         "oil_opex_bbl",
         "gas_opex_mcf",
         "ngl_opex",
         "fixed_loe",
         "ngl_yield",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    ],
+    column_config={
+        "include_slot": st.column_config.CheckboxColumn(
+            "Include",
+            help="Include this slot in the model run.",
+            default=True,
+        ),
+        "dale_promote": st.column_config.CheckboxColumn(
+            "Dale",
+            help=(
+                "Include this slot in its Dale payout group. The payout test uses "
+                "combined USEDC + Granite OCF after LOE and taxes."
+            ),
+            default=False,
+        ),
+        "dale_unit_id": st.column_config.TextColumn(
+            "Dale Unit",
+            help=(
+                "Physical unit identifier. Use the same ID for rows belonging to "
+                "the same unit. Only one row per unit should be flagged as the first well."
+            ),
+        ),
+        "dale_payout_group": st.column_config.TextColumn(
+            "Dale Payout Group",
+            help=(
+                "Unit or agreed well-tranche payout pool. Use the same value when "
+                "multiple units are contractually pooled into one payout test."
+            ),
+        ),
+        "dale_first_well_carry": st.column_config.CheckboxColumn(
+            "Dale 1st Well",
+            help=(
+                "Adds D&C for Dale's initial interest on one gross well in this unit. "
+                "For a four-well slot, checking this still carries only one well."
+            ),
+            default=False,
+        ),
+        "carry_enabled": st.column_config.CheckboxColumn(
+            "Carry",
+            help=(
+                "After Dale's initial interest is removed, USEDC funds D&C at "
+                "the remaining combined USEDC + Granite WI. Granite then receives "
+                "the entered carried share beginning with production."
+            ),
+            default=False,
+        ),
+        "carry_wi_reversion_pct": st.column_config.NumberColumn(
+            "WI Given Up (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            format="%.0f%%",
+            help=(
+                "Enter 5 for Granite to receive 5% of the WI remaining after "
+                "Dale's initial interest is removed."
+            ),
+        ),
+        "slot_id": st.column_config.NumberColumn("Slot", format="%d", disabled=True),
+        "tc_name": st.column_config.SelectboxColumn("Type Curve", options=tc_names, required=True),
+            "gross_wells": st.column_config.NumberColumn("Gross Wells", format="%.2f"),
+            "net_acres": st.column_config.NumberColumn(
+                "Net Acres",
+                format="%.2f",
+            ),
+            "unit_acres": st.column_config.NumberColumn("Unit Acres", format="%,.0f"),
+            "use_calc_unit_acres": st.column_config.CheckboxColumn("Calc Unit Acres"),
+            "pct_unitized": st.column_config.NumberColumn("% Unitized", format="%.2f"),
+            "drilling_spud_month": st.column_config.DateColumn("Spud Month", format="YYYY-MM-DD"),
+            "flowback_delay": st.column_config.NumberColumn("Flowback Delay", format="%d"),
+            "net_revenue_interest": st.column_config.NumberColumn("NRI", format="%.2f"),
+            "lateral_length": st.column_config.NumberColumn("Lateral Length (ft)", format="%,d"),
+            "dc_costs": st.column_config.NumberColumn("D&C ($/ft)", format="$%,.0f"),
+            "tc_risk": st.column_config.NumberColumn(
+                "TC Risk",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Enter as decimal, e.g. 0.97 = 97% TC risk.",
+            ),
+            "bid_per_acre": st.column_config.NumberColumn(
+                "$/Acre Bid",
+                min_value=1.0,
+                step=250.0,
+                format="$%,d",
+                help="Minimum allowed bid is $1 per acre.",
+            ),
+            "oil_diff": st.column_config.NumberColumn("Oil Diff", format="$%.2f"),
+            "gas_diff": st.column_config.NumberColumn("Gas Diff", format="$%.2f"),
+            "ngl_diff": None,
+            "oil_opex_bbl": st.column_config.NumberColumn("Oil Opex", format="$%.2f"),
+            "gas_opex_mcf": st.column_config.NumberColumn("Gas Opex", format="$%.2f"),
+            "ngl_opex": st.column_config.NumberColumn("NGL Opex", format="$%.2f"),
+            "fixed_loe": st.column_config.NumberColumn("Fixed LOE", format="$%,.0f"),
+            "ngl_yield": st.column_config.NumberColumn("NGL Yield", format="%.2f"),
+        },
+    ).copy()
 
-    df["bid_per_acre"] = df["bid_per_acre"].clip(lower=1.0)
-    df["use_calc_unit_acres"] = df["use_calc_unit_acres"].astype(bool)
-    df["tc_name"] = df["tc_name"].astype(str)
-    df["dale_promote"] = df["dale_promote"].astype(bool)
-    df["dale_first_well_carry"] = df["dale_first_well_carry"].astype(bool)
-    df["carry_enabled"] = df["carry_enabled"].astype(bool)
+    apply_slot_changes = st.form_submit_button(
+        "Apply Slot Changes",
+        type="primary",
+    )
 
-    df["carry_wi_reversion_pct"] = (
-        pd.to_numeric(df["carry_wi_reversion_pct"], errors="coerce")
+if load_slots_clicked or refresh_tc_clicked or apply_slot_changes:
+    cleaned_slot_df = edited_slot_df.copy()
+
+    cleaned_slot_df["tc_risk"] = pd.to_numeric(
+        cleaned_slot_df["tc_risk"],
+        errors="coerce",
+    ).fillna(1.0).astype(float)
+
+    cleaned_slot_df["dale_promote"] = (
+        cleaned_slot_df["dale_promote"].fillna(False).astype(bool)
+    )
+    cleaned_slot_df["dale_first_well_carry"] = (
+        cleaned_slot_df["dale_first_well_carry"].fillna(False).astype(bool)
+    )
+    cleaned_slot_df["dale_unit_id"] = (
+        cleaned_slot_df["dale_unit_id"].fillna("").astype(str).str.strip()
+    )
+    cleaned_slot_df["dale_payout_group"] = (
+        cleaned_slot_df["dale_payout_group"].fillna("").astype(str).str.strip()
+    )
+
+    default_unit_ids = cleaned_slot_df["slot_id"].map(
+        lambda x: f"UNIT-{int(x)}"
+    )
+    cleaned_slot_df.loc[
+        cleaned_slot_df["dale_unit_id"].eq(""),
+        "dale_unit_id",
+    ] = default_unit_ids
+    cleaned_slot_df.loc[
+        cleaned_slot_df["dale_payout_group"].eq(""),
+        "dale_payout_group",
+    ] = cleaned_slot_df["dale_unit_id"]
+
+    cleaned_slot_df["carry_enabled"] = (
+        cleaned_slot_df["carry_enabled"]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    cleaned_slot_df["carry_wi_reversion_pct"] = (
+        pd.to_numeric(
+            cleaned_slot_df["carry_wi_reversion_pct"],
+            errors="coerce",
+        )
         .fillna(0.0)
         .clip(lower=0.0, upper=100.0)
-        / 100.0
     )
 
-    default_group = (
-        "UNIT-"
-        + pd.to_numeric(df["slot_id"], errors="coerce")
-        .fillna(0)
-        .astype(int)
-        .astype(str)
-    )
-    df["dale_unit_id"] = df["dale_unit_id"].fillna("").astype(str).str.strip()
-    df.loc[df["dale_unit_id"].eq(""), "dale_unit_id"] = default_group
-
-    df["dale_payout_group"] = (
-        df["dale_payout_group"].fillna("").astype(str).str.strip()
-    )
-    df.loc[df["dale_payout_group"].eq(""), "dale_payout_group"] = df.loc[
-        df["dale_payout_group"].eq(""), "dale_unit_id"
-    ]
-
-    return df
-
-
-def build_slot_audit_view(all_slots_df):
-    df = all_slots_df.copy().sort_values(["slot_id", "date"]).reset_index(drop=True)
-
-    df["month_label"] = df["date"].dt.strftime("%Y-%m")
-    df["cum_slot_total_cf"] = df.groupby("slot_id")["slot_total_cash_flow"].cumsum()
-
-    audit_cols = [
-        "slot_id",
-        "tc_name",
-        "date",
-        "month_label",
-        "period",
-        "index_oil_price",
-        "index_gas_price",
-        "gross_wells",
-        "net_wells",
-        "working_interest",
-        "pre_dale_working_interest",
-        "dale_promote",
-        "dale_unit_id",
-        "dale_payout_group",
-        "dale_first_well_carry",
-        "dale_initial_interest_pct",
-        "dale_initial_working_interest",
-        "post_initial_dale_working_interest",
-        "gr_parties_working_interest",
-        "gr_parties_net_wells",
-        "dale_first_well_carry_wells",
-        "dale_carry_dnc_net_wells",
-        "funded_dnc_net_wells",
-        "carry_reversion_active",
-        "pre_carry_working_interest",
-        "post_carry_working_interest",
-        "economic_limit_reached",
-        "well_shut_in",
-        "pre_shut_in_operating_cf",
-        "slot_promote_ocf",
-        "pre_promote_working_interest",
-        "promote_wi_transferred",
-        "post_promote_working_interest",
-        "effective_working_interest",
-        "pre_promote_net_wells",
-        "post_promote_net_wells",
-        "effective_net_wells",
-        "promote_monthly_investment",
-        "promote_monthly_distributions",
-        "promote_cumulative_investment",
-        "promote_cumulative_distributions",
-        "promote_running_multiple",
-        "promote_hurdle_reached",
-        "promote_active",
-        "promote_hurdle_date",
-        "promote_effective_date",
-        "bid_price_final",
-        "acquisition_cost",
-        "slot_shrink",
-        "slot_ngl_pct_of_wti",
-        "slot_gross_oil_production",
-        "slot_gross_gas_production",
-        "slot_gross_ngl_production",
-        "slot_gross_boe",
-        "slot_net_oil_production",
-        "slot_net_gas_production",
-        "slot_net_ngl_production",
-        "slot_net_boe",
-        "slot_oil_revenue",
-        "slot_gas_revenue",
-        "slot_ngl_revenue",
-        "slot_total_revenue",
-        "slot_loe",
-        "slot_tax",
-        "slot_operating_profit",
-        "slot_base_capex",
-        "slot_dale_carry_capex",
-        "slot_capex",
-        "slot_asset_purchase",
-        "slot_total_cash_flow",
-        "cum_slot_total_cf",
-    ]
-
-    existing_cols = [c for c in audit_cols if c in df.columns]
-    return df[existing_cols]
-
-
-def build_deal_audit_view(deal_df):
-    df = deal_df.copy().sort_values("date").reset_index(drop=True)
-
-    df["month_num"] = np.arange(1, len(df) + 1)
-    df["month_label"] = df["date"].dt.strftime("%Y-%m")
-    df["cum_total_cf"] = df["slot_total_cash_flow"].cumsum()
-
-    audit_cols = [
-        "date",
-        "month_label",
-        "month_num",
-        "index_oil_price",
-        "index_gas_price",
-        "promote_monthly_investment",
-        "promote_monthly_distributions",
-        "promote_cumulative_investment",
-        "promote_cumulative_distributions",
-        "promote_running_multiple",
-        "promote_hurdle_reached",
-        "promote_active",
-        "promote_active_group_count",
-        "promote_total_group_count",
-        "promote_hurdle_date",
-        "promote_effective_date",
-        "slot_gross_oil_production",
-        "slot_gross_gas_production",
-        "slot_gross_ngl_production",
-        "slot_gross_boe",
-        "slot_net_oil_production",
-        "slot_net_gas_production",
-        "slot_net_ngl_production",
-        "slot_net_boe",
-        "slot_oil_revenue",
-        "slot_gas_revenue",
-        "slot_ngl_revenue",
-        "slot_total_revenue",
-        "slot_loe",
-        "slot_tax",
-        "slot_operating_profit",
-        "slot_promote_ocf",
-        "slot_base_capex",
-        "slot_dale_carry_capex",
-        "slot_capex",
-        "slot_asset_purchase",
-        "slot_total_cash_flow",
-        "cum_total_cf",
-    ]
-
-    existing_cols = [c for c in audit_cols if c in df.columns]
-    return df[existing_cols]
-
-def run_deal_metrics(slot_df, deal_inputs, type_curve_file="type_curve_library.xlsx"):
-    """Run the financial engine and return only IRR and MOIC.
-
-    This is the lightweight path used by sensitivities and scenario charts.
-    It intentionally skips the audit-view construction and deal-level pricing
-    merge that are only needed for the detailed base-case outputs.
-    """
-    type_curve_library = load_type_curve_library(type_curve_file)
-    slot_inputs = prepare_slot_inputs(slot_df, deal_inputs)
-    deal_settings = prepare_deal_settings(deal_inputs)
-    global_assumptions = prepare_global_assumptions(deal_inputs)
-
-    all_slots_df = build_all_slot_financials(
-        slot_inputs=slot_inputs,
-        deal_settings=deal_settings,
-        type_curve_library=type_curve_library,
-        global_assumptions=global_assumptions,
-    )
-    all_slots_df = apply_promote_to_slots(all_slots_df, deal_settings)
-    deal_df = roll_up_deal(all_slots_df)
-
-    return calc_financial_irr(deal_df), calc_financial_moic(deal_df)
-
-
-def run_deal_model(slot_df, deal_inputs, type_curve_file="type_curve_library.xlsx"):
-    type_curve_library = load_type_curve_library(type_curve_file)
-    slot_inputs = prepare_slot_inputs(slot_df, deal_inputs)
-    deal_settings = prepare_deal_settings(deal_inputs)
-    global_assumptions = prepare_global_assumptions(deal_inputs)
-
-    all_slots_df = build_all_slot_financials(
-        slot_inputs=slot_inputs,
-        deal_settings=deal_settings,
-        type_curve_library=type_curve_library,
-        global_assumptions=global_assumptions,
+    cleaned_slot_df["bid_per_acre"] = (
+        pd.to_numeric(
+            cleaned_slot_df["bid_per_acre"],
+            errors="coerce",
+        )
+        .fillna(1.0)
+        .clip(lower=1.0)
     )
 
-    all_slots_df = apply_promote_to_slots(all_slots_df, deal_settings)
+    cleaned_slot_df = apply_calc_unit_acres(cleaned_slot_df)
+
+    if load_slots_clicked:
+        cleaned_slot_df = resize_slot_df(
+            cleaned_slot_df,
+            int(num_slots),
+        )
+
+    st.session_state["slot_df"] = cleaned_slot_df
+
+    if refresh_tc_clicked:
+        load_tc_names.clear()
+
+    # Rebuild the editor immediately when rows or dropdown options change.
+    if load_slots_clicked or refresh_tc_clicked:
+        st.rerun()
+
+slot_df = st.session_state["slot_df"].copy()
+current_input_signature = build_model_input_signature(slot_df, deal_inputs)
+
+run_model_clicked = st.button("Run Model", type="primary")
+
+if run_model_clicked:
+    st.session_state["slot_df"] = slot_df
+
+    included_slot_df = slot_df[slot_df["include_slot"].fillna(True)].copy()
+
+    if included_slot_df.empty:
+        st.warning("Please include at least one slot before running the model.")
+
+    elif (included_slot_df["tc_name"] == "Choose TC").any():
+        st.warning("Please select a Type Curve for all included slots before running the model.")
+
+    else:
+        model_slot_df = included_slot_df.drop(columns=["include_slot"], errors="ignore").copy()
+        model_slot_df["bid_per_acre"] = (
+            pd.to_numeric(
+                model_slot_df["bid_per_acre"],
+                errors="coerce",
+            )
+            .fillna(1.0)
+            .clip(lower=1.0)
+        )
+        
+        if deal_inputs.get("dale_promote_override", False):
+            model_slot_df["dale_promote"] = True
+
+        invalid_first_well = model_slot_df[
+            model_slot_df["dale_first_well_carry"].fillna(False)
+            & ~model_slot_df["dale_promote"].fillna(False)
+        ]
+        duplicate_first_well_units = (
+            model_slot_df.loc[
+                model_slot_df["dale_promote"].fillna(False)
+                & model_slot_df["dale_first_well_carry"].fillna(False)
+            ]
+            .groupby("dale_unit_id")
+            .size()
+        )
+        duplicate_first_well_units = duplicate_first_well_units[
+            duplicate_first_well_units > 1
+        ]
+
+        if not invalid_first_well.empty:
+            st.warning(
+                "A Dale first-well carry is checked on a slot that is not Dale eligible."
+            )
+            st.stop()
+
+        if not duplicate_first_well_units.empty:
+            duplicate_text = ", ".join(
+                duplicate_first_well_units.index.astype(str).tolist()
+            )
+            st.warning(
+                "More than one first-well carry is flagged for Dale unit(s): "
+                + duplicate_text
+            )
+            st.stop()
+        
+        run_deal_inputs = deal_inputs.copy()
+        run_deal_inputs["promote_enabled"] = bool(
+            model_slot_df["dale_promote"].fillna(False).any()
+        )
+        
+        if not run_deal_inputs["promote_enabled"]:
+            run_deal_inputs["promote_wi_reversion_pct"] = 0.0
+            run_deal_inputs["promote_multiple"] = 0.0
+        
+        all_slots_df, deal_df, slot_audit_df, deal_audit_df, irr, moic = run_deal_model(
+            model_slot_df,
+            run_deal_inputs,
+        )
+
+        # ------------------------------------------------------------
+        # COMPLIANCE DEAL LOG EXPORT — SAVE EXACT INPUTS USED THIS RUN
+        # ------------------------------------------------------------
+        run_timestamp = pd.Timestamp.now(tz="America/Chicago")
+        
+        overview_rows = [
+            {
+                "Section": "Run Information",
+                "Input": "Model Run Created",
+                "Value": run_timestamp.strftime("%m/%d/%Y %I:%M %p %Z"),
+            },
+            {
+                "Section": "Run Information",
+                "Input": "IRR",
+                "Value": irr,
+            },
+            {
+                "Section": "Run Information",
+                "Input": "MOIC",
+                "Value": moic,
+            },
+        ]
+        
+        # Add every main sidebar / deal assumption used in the run
+        for key, value in run_deal_inputs.items():
+            overview_rows.append(
+                {
+                    "Section": "Sidebar Inputs",
+                    "Input": str(key).replace("_", " ").title(),
+                    "Value": value,
+                }
+            )
+        
+        overview_df = pd.DataFrame(overview_rows)
+        
+        # Save the exact run information. The CSV itself is assembled later
+        # so it can include the opportunity name entered in the export section.
+        deal_log_filename = (
+            f"Utica_Deal_Log_"
+            f"{run_timestamp.strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+        
+        st.session_state["deal_log_overview_df"] = overview_df
+        st.session_state["deal_log_slot_df"] = model_slot_df.copy()
+        st.session_state["deal_log_filename"] = deal_log_filename
+        st.session_state["model_deal_inputs"] = run_deal_inputs
+        st.session_state["model_slot_df"] = model_slot_df
+        st.session_state["all_slots_df"] = all_slots_df
+        st.session_state["deal_df"] = deal_df
+        st.session_state["slot_audit_df"] = slot_audit_df
+        st.session_state["deal_audit_df"] = deal_audit_df
+        st.session_state["audit_excel_data"] = to_excel_bytes(
+            deal_audit_df, slot_audit_df
+        )
+        st.session_state["irr"] = irr
+        st.session_state["moic"] = moic
+        st.session_state["base_input_signature"] = current_input_signature
+        st.session_state["sensitivity_results"] = {}
+        st.session_state["base_charts"] = {}
+        st.session_state["base_charts_signature"] = None
+        st.session_state.pop("email_html", None)
+        st.session_state.pop("email_html_signature", None)
+        st.session_state.pop("email_html_opportunity_name", None)
+        st.session_state["model_has_run"] = True
+
+
+# -----------------------------
+# Results
+# -----------------------------
+DEAL_DISPLAY_COLS = [
+    "date",
+    "index_oil_price",
+    "index_gas_price",
+    "promote_cumulative_investment",
+    "promote_cumulative_distributions",
+    "promote_running_multiple",
+    "promote_hurdle_reached",
+    "promote_active",
+    "promote_active_group_count",
+    "promote_total_group_count",
+    "promote_hurdle_date",
+    "promote_effective_date",
+    "slot_net_oil_production",
+    "slot_net_gas_production",
+    "slot_net_ngl_production",
+    "slot_oil_revenue",
+    "slot_gas_revenue",
+    "slot_ngl_revenue",
+    "slot_total_revenue",
+    "slot_loe",
+    "slot_tax",
+    "slot_operating_profit",
+    "slot_base_capex",
+    "slot_dale_carry_capex",
+    "slot_capex",
+    "slot_asset_purchase",
+    "slot_total_cash_flow",
+    "cum_total_cf",
+]
+
+SLOT_DISPLAY_COLS = [
+    "slot_id",
+    "tc_name",
+    "date",
+    "index_oil_price",
+    "index_gas_price",
+    "economic_limit_reached",
+    "well_shut_in",
+    "pre_shut_in_operating_cf",
+    "dale_promote",
+    "dale_unit_id",
+    "dale_payout_group",
+    "dale_first_well_carry",
+    "dale_initial_interest_pct",
+    "dale_initial_working_interest",
+    "dale_carry_dnc_net_wells",
+    "funded_dnc_net_wells",
+    "pre_carry_working_interest",
+    "post_carry_working_interest",
+    "slot_promote_ocf",
+    "pre_promote_working_interest",
+    "promote_wi_transferred",
+    "post_promote_working_interest",
+    "effective_working_interest",
+    "promote_running_multiple",
+    "promote_hurdle_reached",
+    "promote_active",
+    "promote_hurdle_date",
+    "promote_effective_date",
+    "slot_net_oil_production",
+    "slot_net_gas_production",
+    "slot_net_ngl_production",
+    "slot_oil_revenue",
+    "slot_gas_revenue",
+    "slot_ngl_revenue",
+    "slot_total_revenue",
+    "slot_loe",
+    "slot_tax",
+    "slot_operating_profit",
+    "slot_base_capex",
+    "slot_dale_carry_capex",
+    "slot_capex",
+    "slot_asset_purchase",
+    "slot_total_cash_flow",
+    "cum_total_cf",
+]
+
+if (
+    st.session_state["model_has_run"]
+    and st.session_state["deal_df"] is not None
+    and st.session_state["all_slots_df"] is not None
+    and st.session_state["model_slot_df"] is not None
+):
+    all_slots_df = st.session_state["all_slots_df"]
+    deal_df = st.session_state["deal_df"]
+    irr = st.session_state["irr"]
+    moic = st.session_state["moic"]
+    deal_audit_df = st.session_state["deal_audit_df"]
+    slot_audit_df = st.session_state["slot_audit_df"]
+    slot_df = st.session_state["model_slot_df"].copy()
+    deal_inputs = st.session_state.get("model_deal_inputs", deal_inputs).copy()
+    base_input_signature = st.session_state.get("base_input_signature")
+    inputs_stale = (
+        base_input_signature is None
+        or current_input_signature != base_input_signature
+    )
+
+    if inputs_stale:
+        st.warning(
+            "Inputs have changed since the model was last run. The saved base "
+            "results remain visible, but rerun the base model before generating "
+            "sensitivities, charts, or a new email draft."
+        )
+
+    # These controls only change sensitivity construction, not the base case,
+    # so they update immediately without requiring the base model to rerun.
+    deal_inputs["use_tc_risk_as_main_sensitivity"] = (
+        use_tc_risk_as_main_sensitivity
+    )
+    deal_inputs["use_dc_pct_sensitivity"] = use_dc_pct_sensitivity
+
+    deal_display_df = deal_audit_df[[col for col in DEAL_DISPLAY_COLS if col in deal_audit_df.columns]].copy()
+    slot_display_df = slot_audit_df[[col for col in SLOT_DISPLAY_COLS if col in slot_audit_df.columns]].copy()
+
+    deal_audit_display_df = format_display_df(deal_display_df)
+    slot_audit_display_df = format_display_df(slot_display_df)
+    dale_group_audit_df = build_dale_group_audit(slot_audit_df)
+    audit_excel_data = st.session_state.get("audit_excel_data")
+    if audit_excel_data is None:
+        audit_excel_data = to_excel_bytes(deal_audit_df, slot_audit_df)
+        st.session_state["audit_excel_data"] = audit_excel_data
+
+    with st.expander("Monthly Data", expanded=False):
+        st.subheader("Total Deal Monthly Data")
+        st.dataframe(deal_audit_display_df, use_container_width=True)
+
+        if not dale_group_audit_df.empty:
+            st.subheader("Dale Payout Group Monthly Data")
+            st.dataframe(
+                format_display_df(dale_group_audit_df),
+                use_container_width=True,
+            )
+
+        st.subheader("Type Curve Monthly Data")
+        st.dataframe(slot_audit_display_df, use_container_width=True)
+
+        st.download_button(
+            "Download in Excel",
+            audit_excel_data,
+            file_name="deal_audit.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="monthly_data_download_excel",
+        )
+
+    st.subheader("Deal Summary")
+
+    total_net_acres = slot_df["net_acres"].sum()
+
+    if deal_inputs["use_bid_override"]:
+        total_acquisition = total_net_acres * deal_inputs["bid_override"]
+    else:
+        total_acquisition = (slot_df["net_acres"] * slot_df["bid_per_acre"]).sum()
+
+    blended_bid = total_acquisition / total_net_acres if total_net_acres > 0 else 0.0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("Total Net Acres", format_accounting_number(total_net_acres, decimals=1))
+    with col2:
+        total_acquisition_cost = -deal_df["slot_asset_purchase"].sum()
+        st.metric("Acquisition Cost", format_thousands_short(total_acquisition_cost, decimals=1))
+    with col3:
+        st.metric("$/Acre Bid", format_accounting_number(blended_bid, decimals=0, prefix="$"))
+    with col4:
+        st.metric("IRR", format_accounting_percent(irr, decimals=1, zero_as_dash=False) if irr is not None else "N/A")
+    with col5:
+        st.metric("MOIC", format_accounting_number(moic, decimals=2, suffix="x", zero_as_dash=False) if moic is not None else "N/A")
+
+    if bool(deal_inputs.get("promote_enabled", False)):
+        active_dates = deal_df.loc[
+            deal_df.get("promote_active", False).fillna(False),
+            "date",
+        ] if "promote_active" in deal_df.columns else pd.Series(dtype="datetime64[ns]")
+
+        if not active_dates.empty:
+            promote_effective_date = pd.to_datetime(active_dates.iloc[0])
+            transferred_pct = float(
+                deal_inputs.get("promote_wi_reversion_pct", 0.0)
+            )
+            st.info(
+                f"WI reversion becomes effective {promote_effective_date:%m/%d/%Y}: "
+                f"{transferred_pct:.2f}% of each party's then-current WI transfers after its "
+                f"{float(deal_inputs.get('promote_multiple', 0.0)):.2f}x OCF hurdle. "
+                "The date shown is the earliest active Dale payout group."
+            )
+        else:
+            st.info(
+                "WI reversion is enabled but does not reach its investment "
+                "multiple during the modeled period."
+            )
+
+    base_dc = (
+        deal_inputs["dc_override"]
+        if deal_inputs["use_dc_override"]
+        else weighted_avg_by_net_acres(slot_df, "dc_costs")
+    )
     
-    deal_df = roll_up_deal(all_slots_df)
+    base_bid = max(
+        1.0,
+        (
+            deal_inputs["bid_override"]
+            if deal_inputs["use_bid_override"]
+            else weighted_avg_by_net_acres(slot_df, "bid_per_acre")
+        ),
+    )
+
+    sensitivity_irr_heatmaps = {}
+
+    if not disable_heavy_outputs:
+        st.subheader("Sensitivity Tables")
+
+        control_col1, control_col2 = st.columns(2)
+        with control_col1:
+            use_tc_risk_as_main_sensitivity = st.toggle(
+                "Use TC Risk as Main Sensitivity Variable",
+                key="use_tc_risk_as_main_sensitivity",
+                help=(
+                    "Off = $/Acre Bid is the main row variable. "
+                    "On = TC Risk is the main row variable."
+                ),
+            )
+        with control_col2:
+            use_dc_pct_sensitivity = st.toggle(
+                "Use 5% D&C Sensitivity Steps",
+                key="use_dc_pct_sensitivity",
+                help=(
+                    "Off = $50/ft increments. On = 5% increments around "
+                    "the base D&C assumption."
+                ),
+            )
+
+        deal_inputs["use_tc_risk_as_main_sensitivity"] = (
+            use_tc_risk_as_main_sensitivity
+        )
+        deal_inputs["use_dc_pct_sensitivity"] = use_dc_pct_sensitivity
+
+        if deal_inputs.get("pricing_mode") == "file":
+            st.caption(
+                "In monthly pricing mode, oil and gas sensitivities shift the "
+                "entire uploaded pricing curve by the change from the base "
+                "terminal price and apply the sensitivity value as the new "
+                "terminal flat price."
+            )
+
+        base_tc_risk = weighted_avg_by_net_acres(slot_df, "tc_risk")
+        base_ngl_yield = weighted_avg_by_net_acres(slot_df, "ngl_yield")
+
+        bid_values = build_sensitivity_range(
+            base_bid, 500.0, 4, min_value=1.0
+        )
+        tc_risk_values = [
+            max(0.0, base_tc_risk + 0.05 * i)
+            for i in range(-4, 5)
+        ]
+        if use_dc_pct_sensitivity:
+            dc_values = build_percentage_sensitivity_range(
+                base_dc, pct_step=0.05, steps_each_way=4, min_value=0.0
+            )
+        else:
+            dc_values = build_sensitivity_range(
+                base_dc, 50.0, 4, min_value=0.0
+            )
+
+        oil_values = build_sensitivity_range(
+            float(deal_inputs["oil_price"]), 5.0, 4
+        )
+        gas_values = build_sensitivity_range(
+            float(deal_inputs["gas_price"]), 0.25, 4
+        )
+        ngl_yield_values = build_sensitivity_range(
+            base_value=base_ngl_yield,
+            step=0.50,
+            steps_each_way=4,
+            min_value=0.0,
+        )
+        base_spud_month = weighted_avg_spud_month_by_net_acres(slot_df)
+        spud_date_values = [
+            base_spud_month + pd.DateOffset(months=3 * i)
+            for i in range(-4, 5)
+        ]
+
+        if use_tc_risk_as_main_sensitivity:
+            main_values = tc_risk_values
+            main_variable = "tc_risk"
+            main_title = "TC Risk"
+            main_format = "percent"
+            main_base = base_tc_risk
+
+            cross_x_values = bid_values
+            cross_x_variable = "bid"
+            cross_x_title = "$/Acre Bid"
+            cross_x_format = "dollar"
+            cross_base_x = base_bid
+        else:
+            main_values = bid_values
+            main_variable = "bid"
+            main_title = "$/Acre Bid"
+            main_format = "dollar"
+            main_base = base_bid
+
+            cross_x_values = tc_risk_values
+            cross_x_variable = "tc_risk"
+            cross_x_title = "TC Risk"
+            cross_x_format = "percent"
+            cross_base_x = base_tc_risk
+
+        sensitivity_specs = [
+            {
+                "key": "dc_main",
+                "title": f"D&C Costs ($/ft) vs. {main_title} Sensitivity",
+                "x_values": dc_values,
+                "x_variable": "dc",
+                "y_values": main_values,
+                "y_variable": main_variable,
+                "x_title": "D&C Costs ($/ft)",
+                "y_title": main_title,
+                "x_format": "dollar",
+                "y_format": main_format,
+                "base_x": base_dc,
+                "base_y": main_base,
+                "expanded": True,
+            },
+            {
+                "key": "oil_main",
+                "title": f"Oil Price vs. {main_title} Sensitivity",
+                "x_values": oil_values,
+                "x_variable": "oil",
+                "y_values": main_values,
+                "y_variable": main_variable,
+                "x_title": "Oil Price ($/bbl)",
+                "y_title": main_title,
+                "x_format": "dollar",
+                "y_format": main_format,
+                "base_x": deal_inputs["oil_price"],
+                "base_y": main_base,
+            },
+            {
+                "key": "ngl_main",
+                "title": f"NGL Yield (GPM) vs. {main_title} Sensitivity",
+                "x_values": ngl_yield_values,
+                "x_variable": "ngl_yield",
+                "y_values": main_values,
+                "y_variable": main_variable,
+                "x_title": "NGL Yield (GPM)",
+                "y_title": main_title,
+                "x_format": "float2",
+                "y_format": main_format,
+                "base_x": base_ngl_yield,
+                "base_y": main_base,
+            },
+            {
+                "key": "gas_main",
+                "title": f"Gas Price vs. {main_title} Sensitivity",
+                "x_values": gas_values,
+                "x_variable": "gas",
+                "y_values": main_values,
+                "y_variable": main_variable,
+                "x_title": "Gas Price ($/mcf)",
+                "y_title": main_title,
+                "x_format": "dollar",
+                "y_format": main_format,
+                "base_x": deal_inputs["gas_price"],
+                "base_y": main_base,
+            },
+            {
+                "key": "gas_dc",
+                "title": "Gas Price vs. D&C Costs Sensitivity",
+                "x_values": gas_values,
+                "x_variable": "gas",
+                "y_values": dc_values,
+                "y_variable": "dc",
+                "x_title": "Gas Price ($/mcf)",
+                "y_title": "D&C Costs ($/ft)",
+                "x_format": "dollar",
+                "y_format": "dollar",
+                "base_x": deal_inputs["gas_price"],
+                "base_y": base_dc,
+            },
+            {
+                "key": "oil_gas",
+                "title": "Oil Price vs. Gas Price Sensitivity",
+                "x_values": oil_values,
+                "x_variable": "oil",
+                "y_values": gas_values,
+                "y_variable": "gas",
+                "x_title": "Oil Price ($/bbl)",
+                "y_title": "Gas Price ($/mcf)",
+                "x_format": "dollar",
+                "y_format": "dollar",
+                "base_x": deal_inputs["oil_price"],
+                "base_y": deal_inputs["gas_price"],
+            },
+            {
+                "key": "cross_main",
+                "title": f"{cross_x_title} vs. {main_title} Sensitivity",
+                "x_values": cross_x_values,
+                "x_variable": cross_x_variable,
+                "y_values": main_values,
+                "y_variable": main_variable,
+                "x_title": cross_x_title,
+                "y_title": main_title,
+                "x_format": cross_x_format,
+                "y_format": main_format,
+                "base_x": cross_base_x,
+                "base_y": main_base,
+            },
+            {
+                "key": "spud_tc",
+                "title": "Spud Date vs. TC Risk Sensitivity",
+                "x_values": spud_date_values,
+                "x_variable": "spud_date",
+                "y_values": tc_risk_values,
+                "y_variable": "tc_risk",
+                "x_title": "Spud Date",
+                "y_title": "TC Risk",
+                "x_format": "date",
+                "y_format": "percent",
+                "base_x": base_spud_month,
+                "base_y": base_tc_risk,
+                "caption": (
+                    "Spud timing shifts in 3-month increments from 12 months "
+                    "earlier to 12 months later. Every slot shifts by the same "
+                    "amount so relative timing is preserved."
+                ),
+            },
+        ]
+
+        for spec in sensitivity_specs:
+            spec_signature = build_sensitivity_signature(
+                base_input_signature,
+                spec["key"],
+                spec["x_values"],
+                spec["x_variable"],
+                spec["y_values"],
+                spec["y_variable"],
+            )
+            saved_result = st.session_state["sensitivity_results"].get(
+                spec["key"]
+            )
+            result_is_current = bool(
+                saved_result
+                and saved_result.get("signature") == spec_signature
+            )
+
+            title_col, status_col, button_col = st.columns([5.2, 1.3, 1.1])
+            with title_col:
+                st.markdown(f"#### {spec['title']}")
+            with status_col:
+                if result_is_current:
+                    st.caption("Generated")
+                elif saved_result:
+                    st.caption("Needs refresh")
+                else:
+                    st.caption("Not generated")
+            with button_col:
+                generate_clicked = st.button(
+                    "Generate",
+                    key=f"generate_{spec['key']}",
+                    use_container_width=True,
+                    disabled=inputs_stale,
+                )
+
+            if generate_clicked:
+                with st.spinner(f"Generating {spec['title']}..."):
+                    irr_df, moic_df = run_two_way_sensitivity(
+                        slot_df=slot_df,
+                        deal_inputs=deal_inputs,
+                        x_values=spec["x_values"],
+                        x_variable=spec["x_variable"],
+                        y_values=spec["y_values"],
+                        y_variable=spec["y_variable"],
+                    )
+                updated_results = dict(
+                    st.session_state.get("sensitivity_results", {})
+                )
+                updated_results[spec["key"]] = {
+                    "irr": irr_df,
+                    "moic": moic_df,
+                    "signature": spec_signature,
+                }
+                st.session_state["sensitivity_results"] = updated_results
+                st.session_state.pop("email_html", None)
+                saved_result = updated_results[spec["key"]]
+                result_is_current = True
+
+            with st.expander(
+                "View IRR and MOIC Heatmaps",
+                expanded=bool(spec.get("expanded", False) and result_is_current),
+            ):
+                if spec.get("caption"):
+                    st.caption(spec["caption"])
+
+                if not result_is_current:
+                    if inputs_stale:
+                        st.info("Rerun the base model before generating this sensitivity.")
+                    else:
+                        st.info("Click Generate to calculate this sensitivity.")
+                else:
+                    irr_heatmap_current = build_heatmap(
+                        saved_result["irr"],
+                        "IRR Sensitivity",
+                        metric="irr",
+                        x_title=spec["x_title"],
+                        y_title=spec["y_title"],
+                        x_format=spec["x_format"],
+                        y_format=spec["y_format"],
+                        base_x=spec["base_x"],
+                        base_y=spec["base_y"],
+                    )
+                    moic_heatmap_current = build_heatmap(
+                        saved_result["moic"],
+                        "MOIC Sensitivity",
+                        metric="moic",
+                        x_title=spec["x_title"],
+                        y_title=spec["y_title"],
+                        x_format=spec["x_format"],
+                        y_format=spec["y_format"],
+                        base_x=spec["base_x"],
+                        base_y=spec["base_y"],
+                    )
+                    sensitivity_irr_heatmaps[spec["key"]] = irr_heatmap_current
+                    irr_col, moic_col = st.columns(2)
+                    with irr_col:
+                        st.markdown("### IRR Sensitivity")
+                        st.plotly_chart(
+                            irr_heatmap_current, use_container_width=True
+                        )
+                    with moic_col:
+                        st.markdown("### MOIC Sensitivity")
+                        st.plotly_chart(
+                            moic_heatmap_current, use_container_width=True
+                        )
+
+        # ------------------------------------------------------------
+        # Carry / Entry sensitivities
+        # ------------------------------------------------------------
+        st.markdown("### Carry / Entry Sensitivities")
+        st.caption(
+            "These sensitivities use seven user-defined carry or $/acre levels. "
+            "The D&C axis uses the same D&C sensitivity logic as the tables above: "
+            "when there is no deal-level D&C override, the same $/ft change is added "
+            "to each slot's own D&C assumption rather than replacing all slots with "
+            "the weighted-average D&C."
+        )
+
+        carry_input_col1, carry_input_col2, bid_input_col1, bid_input_col2 = st.columns(4)
+
+        with carry_input_col1:
+            carry_sens_start_pct = st.number_input(
+                "Starting Carry (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=10.0,
+                step=1.0,
+                format="%.1f",
+                key="carry_sens_start_pct",
+            )
+
+        with carry_input_col2:
+            carry_sens_step_pct = st.number_input(
+                "Carry Step (%)",
+                min_value=0.1,
+                value=5.0,
+                step=0.5,
+                format="%.1f",
+                key="carry_sens_step_pct",
+            )
+
+        with bid_input_col1:
+            bid_sens_start = st.number_input(
+                "Starting $/Acre",
+                min_value=1.0,
+                value=float(max(1.0, base_bid)),
+                step=250.0,
+                format="%.0f",
+                key="carry_area_bid_sens_start",
+            )
+
+        with bid_input_col2:
+            bid_sens_step = st.number_input(
+                "$/Acre Step",
+                min_value=1.0,
+                value=500.0,
+                step=50.0,
+                format="%.0f",
+                key="carry_area_bid_sens_step",
+            )
+
+        carry_range_is_valid = (
+            float(carry_sens_start_pct)
+            + (6.0 * float(carry_sens_step_pct))
+            <= 100.0
+        )
+
+        if not carry_range_is_valid:
+            st.warning(
+                "Starting Carry + six Carry Steps must be 100% or less so the "
+                "sensitivity contains seven distinct carry levels."
+            )
+
+        carry_sens_values = [
+            round(
+                (
+                    float(carry_sens_start_pct)
+                    + float(carry_sens_step_pct) * i
+                ) / 100.0,
+                10,
+            )
+            for i in range(7)
+        ]
+        bid_sens_values = [
+            max(
+                1.0,
+                round(
+                    float(bid_sens_start)
+                    + float(bid_sens_step) * i,
+                    10,
+                ),
+            )
+            for i in range(7)
+        ]
+
+        carry_entry_specs = [
+            {
+                "key": "carry_dc_custom",
+                "title": "Carry vs. D&C Costs Sensitivity",
+                "x_values": dc_values,
+                "x_variable": "dc",
+                "y_values": carry_sens_values,
+                "y_variable": "carry",
+                "x_title": "D&C Costs ($/ft)",
+                "y_title": "Carry",
+                "x_format": "dollar",
+                "y_format": "percent",
+                "enabled": carry_range_is_valid,
+                "caption": (
+                    "Carry applies as a deal-level override to every included slot. "
+                    "For example, 20% is economically identical to entering a 20% "
+                    "carry in every individual slot."
+                ),
+            },
+            {
+                "key": "bid_dc_custom",
+                "title": "$/Acre vs. D&C Costs Sensitivity",
+                "x_values": dc_values,
+                "x_variable": "dc",
+                "y_values": bid_sens_values,
+                "y_variable": "bid",
+                "x_title": "D&C Costs ($/ft)",
+                "y_title": "$/Acre Bid",
+                "x_format": "dollar",
+                "y_format": "dollar",
+                "enabled": True,
+                "caption": (
+                    "The $/acre axis starts at the entered value and increases by "
+                    "the entered step for seven total levels."
+                ),
+            },
+        ]
+
+        for spec in carry_entry_specs:
+            spec_signature = build_sensitivity_signature(
+                base_input_signature,
+                spec["key"],
+                spec["x_values"],
+                spec["x_variable"],
+                spec["y_values"],
+                spec["y_variable"],
+            )
+            saved_result = st.session_state["sensitivity_results"].get(
+                spec["key"]
+            )
+            result_is_current = bool(
+                saved_result
+                and saved_result.get("signature") == spec_signature
+            )
+
+            title_col, status_col, button_col = st.columns([5.2, 1.3, 1.1])
+            with title_col:
+                st.markdown(f"#### {spec['title']}")
+            with status_col:
+                if result_is_current:
+                    st.caption("Generated")
+                elif saved_result:
+                    st.caption("Needs refresh")
+                else:
+                    st.caption("Not generated")
+            with button_col:
+                generate_clicked = st.button(
+                    "Generate",
+                    key=f"generate_{spec['key']}",
+                    use_container_width=True,
+                    disabled=(inputs_stale or not spec["enabled"]),
+                )
+
+            if spec.get("caption"):
+                st.caption(spec["caption"])
+
+            if generate_clicked:
+                with st.spinner(f"Generating {spec['title']}..."):
+                    irr_df, moic_df = run_two_way_sensitivity(
+                        slot_df=slot_df,
+                        deal_inputs=deal_inputs,
+                        x_values=spec["x_values"],
+                        x_variable=spec["x_variable"],
+                        y_values=spec["y_values"],
+                        y_variable=spec["y_variable"],
+                    )
+                updated_results = dict(
+                    st.session_state.get("sensitivity_results", {})
+                )
+                updated_results[spec["key"]] = {
+                    "irr": irr_df,
+                    "moic": moic_df,
+                    "signature": spec_signature,
+                }
+                st.session_state["sensitivity_results"] = updated_results
+                saved_result = updated_results[spec["key"]]
+                result_is_current = True
+
+            with st.expander(
+                "View IRR and MOIC Heatmaps",
+                expanded=bool(result_is_current),
+            ):
+                if not result_is_current:
+                    if inputs_stale:
+                        st.info(
+                            "Rerun the base model before generating this sensitivity."
+                        )
+                    elif not spec["enabled"]:
+                        st.info("Adjust the carry range so all seven levels are 100% or less.")
+                    else:
+                        st.info("Click Generate to calculate this sensitivity.")
+                else:
+                    irr_heatmap_current = build_heatmap(
+                        saved_result["irr"],
+                        "IRR Sensitivity",
+                        metric="irr",
+                        x_title=spec["x_title"],
+                        y_title=spec["y_title"],
+                        x_format=spec["x_format"],
+                        y_format=spec["y_format"],
+                    )
+                    moic_heatmap_current = build_heatmap(
+                        saved_result["moic"],
+                        "MOIC Sensitivity",
+                        metric="moic",
+                        x_title=spec["x_title"],
+                        y_title=spec["y_title"],
+                        x_format=spec["x_format"],
+                        y_format=spec["y_format"],
+                    )
+
+                    irr_col, moic_col = st.columns(2)
+                    with irr_col:
+                        st.markdown("### IRR Sensitivity")
+                        st.plotly_chart(
+                            irr_heatmap_current,
+                            use_container_width=True,
+                            key=f"irr_chart_{spec['key']}",
+                        )
+                    with moic_col:
+                        st.markdown("### MOIC Sensitivity")
+                        st.plotly_chart(
+                            moic_heatmap_current,
+                            use_container_width=True,
+                            key=f"moic_chart_{spec['key']}",
+                        )
+
+    st.subheader("Outputs")
     
-    deal_index_pricing = build_index_price_series(
-        dates=deal_df["date"],
-        global_assumptions=global_assumptions,
+    slot_returns = run_individual_slot_returns(
+        slot_df=slot_df,
+        deal_inputs=deal_inputs,
     )
     
-    deal_df = deal_df.merge(
-        deal_index_pricing,
-        on="date",
-        how="left",
+    tc_output_display_df, tc_output_row_styles = build_tc_assumptions_output_display_table(
+        slot_df=slot_df,
+        deal_inputs=deal_inputs,
+        slot_returns=slot_returns,
+    )
+    tc_output_styler = style_tc_assumptions_output_table(
+        tc_output_display_df,
+        tc_output_row_styles,
     )
     
-    slot_audit_df = build_slot_audit_view(all_slots_df)
-    deal_audit_df = build_deal_audit_view(deal_df)
+    quarterly_output_df = build_quarterly_output_table(
+        deal_df=deal_df,
+        all_slots_df=all_slots_df,
+        slot_df=slot_df,
+        deal_inputs=deal_inputs,
+    )
+    
+    quarterly_output_display_df, quarterly_row_styles = build_quarterly_output_display_table(quarterly_output_df)
+    quarterly_output_styler = style_quarterly_output_table(
+        quarterly_output_display_df,
+        quarterly_row_styles,
+    )
+    
+    with st.expander("TC Assumptions Output", expanded=False):
+        st.markdown(tc_output_styler.to_html(), unsafe_allow_html=True)
+    
+    with st.expander("Quarterly Output", expanded=False):
+        st.markdown(quarterly_output_styler.to_html(), unsafe_allow_html=True)
+    
+        st.markdown("### Deal Highlights")
+        h1, h2, h3, h4 = st.columns(4)
+    
+        with h1:
+            render_deal_highlight_box(
+                "IRR",
+                format_accounting_percent(irr, decimals=1, zero_as_dash=False) if irr is not None else "N/A",
+            )
+        with h2:
+            render_deal_highlight_box(
+                "MOIC",
+                format_accounting_number(moic, decimals=2, suffix="x", zero_as_dash=False) if moic is not None else "N/A",
+            )
+        with h3:
+            render_deal_highlight_box(
+                "Net Acres",
+                format_accounting_number(total_net_acres, decimals=1),
+            )
+        with h4:
+            render_deal_highlight_box(
+                "$/Acre Bid",
+                format_accounting_number(blended_bid, decimals=0, prefix="$"),
+            )
 
-    irr = calc_financial_irr(deal_df)
-    moic = calc_financial_moic(deal_df)
+    if not disable_heavy_outputs:
+        st.subheader("Charts and Graphs")
 
-    return all_slots_df, deal_df, slot_audit_df, deal_audit_df, irr, moic
+        chart_control_col, chart_button_col = st.columns([4.5, 1.5])
+        with chart_control_col:
+            prod_chart_view = st.radio(
+                "Production Chart View",
+                ["Stacked Mcfe/d", "Stream Split"],
+                horizontal=True,
+                key="prod_chart_view",
+            )
+        with chart_button_col:
+            generate_charts_clicked = st.button(
+                "Generate Charts",
+                key="generate_base_charts",
+                type="primary",
+                use_container_width=True,
+                disabled=inputs_stale,
+            )
+
+        if generate_charts_clicked:
+            with st.spinner("Generating charts and scenario matrix..."):
+                cumulative_chart = build_cumulative_fcf_chart(deal_df, slot_df)
+                production_stacked_chart = build_production_profile_chart(
+                    deal_df, chart_view="Stacked Mcfe/d"
+                )
+                production_stream_chart = build_production_profile_chart(
+                    deal_df, chart_view="Stream Split"
+                )
+                scenario_chart = build_scenario_scatter_chart(
+                    slot_df=slot_df,
+                    deal_inputs=deal_inputs,
+                    base_bid=base_bid,
+                    base_dc=base_dc,
+                )
+
+            st.session_state["base_charts"] = {
+                "cumulative_fcf": cumulative_chart,
+                "production_stacked": production_stacked_chart,
+                "production_stream": production_stream_chart,
+                "scenario_scatter": scenario_chart,
+            }
+            st.session_state["base_charts_signature"] = base_input_signature
+            st.session_state.pop("email_html", None)
+
+        base_charts = st.session_state.get("base_charts", {})
+        charts_are_current = bool(
+            base_charts
+            and st.session_state.get("base_charts_signature")
+            == base_input_signature
+        )
+
+        if not charts_are_current:
+            if inputs_stale:
+                st.info("Rerun the base model before generating charts.")
+            else:
+                st.info(
+                    "Click Generate Charts to build the cumulative FCF, "
+                    "production, and scenario-matrix charts."
+                )
+        else:
+            with st.expander("Charts", expanded=False):
+                chart_tab1, chart_tab2, chart_tab3 = st.tabs(
+                    ["Cumulative FCF", "Production", "Scenario Matrix"]
+                )
+                with chart_tab1:
+                    st.plotly_chart(
+                        base_charts["cumulative_fcf"],
+                        use_container_width=True,
+                    )
+                with chart_tab2:
+                    production_key = (
+                        "production_stacked"
+                        if prod_chart_view == "Stacked Mcfe/d"
+                        else "production_stream"
+                    )
+                    st.plotly_chart(
+                        base_charts[production_key],
+                        use_container_width=True,
+                    )
+                with chart_tab3:
+                    st.plotly_chart(
+                        base_charts["scenario_scatter"],
+                        use_container_width=True,
+                    )
+
+        st.subheader("Email Draft Export")
+
+        if st.session_state.get("email_opportunity_name") == "Fill Name Here":
+            st.session_state["email_opportunity_name"] = ""
+
+        opportunity_name = st.text_input(
+            "Opportunity Name for Email Draft / Deal Log",
+            placeholder="Fill Name Here",
+            key="email_opportunity_name",
+        )
+        opportunity_name_clean = opportunity_name.strip()
+        exports_enabled = bool(opportunity_name_clean)
+
+        if not exports_enabled:
+            st.caption(
+                "Enter an opportunity name to enable the email and deal-log downloads."
+            )
+
+        email_signature_payload = {
+            "base": base_input_signature,
+            "charts": st.session_state.get("base_charts_signature"),
+            "sensitivity_controls": {
+                "use_tc_risk_as_main_sensitivity": (
+                    use_tc_risk_as_main_sensitivity
+                ),
+                "use_dc_pct_sensitivity": use_dc_pct_sensitivity,
+            },
+            "sensitivities": {
+                key: value.get("signature")
+                for key, value in st.session_state.get(
+                    "sensitivity_results", {}
+                ).items()
+            },
+        }
+        email_signature = hashlib.sha256(
+            json.dumps(
+                email_signature_payload, sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+
+        generate_email_clicked = st.button(
+            "Generate Email Draft",
+            key="generate_email_draft",
+            use_container_width=False,
+            disabled=(
+                not exports_enabled
+                or inputs_stale
+                or not charts_are_current
+            ),
+        )
+
+        if generate_email_clicked:
+            cumulative_for_email = go.Figure(
+                base_charts["cumulative_fcf"]
+            )
+            cumulative_for_email.update_layout(
+                shapes=[],
+                annotations=[],
+                margin=dict(l=55, r=35, t=65, b=55),
+            )
+            cumulative_for_email.add_hline(
+                y=0,
+                line_width=1,
+                line_dash="dash",
+                line_color="gray",
+            )
+
+            email_html = build_email_html(
+                opportunity_name=opportunity_name_clean,
+                deal_inputs=deal_inputs,
+                slot_df=slot_df,
+                irr=irr,
+                moic=moic,
+                tc_output_styler=tc_output_styler,
+                quarterly_output_styler=quarterly_output_styler,
+                irr_oil_bid_heatmap=sensitivity_irr_heatmaps.get("oil_main"),
+                irr_gas_bid_heatmap=sensitivity_irr_heatmaps.get("gas_main"),
+                irr_oil_gas_heatmap=sensitivity_irr_heatmaps.get("oil_gas"),
+                irr_gas_dc_heatmap=sensitivity_irr_heatmaps.get("gas_dc"),
+                irr_heatmap=sensitivity_irr_heatmaps.get("dc_main"),
+                irr_tcrisk_bid_heatmap=sensitivity_irr_heatmaps.get("cross_main"),
+                irr_ngl_yield_bid_heatmap=sensitivity_irr_heatmaps.get("ngl_main"),
+                irr_spud_tcrisk_heatmap=sensitivity_irr_heatmaps.get("spud_tc"),
+                cum_fcf_chart=cumulative_for_email,
+                prod_chart_stacked=base_charts["production_stacked"],
+                scenario_scatter_chart=base_charts["scenario_scatter"],
+            )
+            st.session_state["email_html"] = email_html
+            st.session_state["email_html_signature"] = email_signature
+            st.session_state["email_html_opportunity_name"] = (
+                opportunity_name_clean
+            )
+
+        saved_email_html = st.session_state.get("email_html")
+        email_is_current = bool(
+            saved_email_html
+            and st.session_state.get("email_html_signature")
+            == email_signature
+            and st.session_state.get("email_html_opportunity_name")
+            == opportunity_name_clean
+        )
+
+        if email_is_current:
+            with st.expander("Preview Email Draft", expanded=False):
+                st.components.v1.html(
+                    saved_email_html, height=900, scrolling=True
+                )
+
+            st.download_button(
+                label="Download Email Draft (HTML)",
+                data=saved_email_html,
+                file_name="utica_email_draft.html",
+                mime="text/html",
+                key="download_email_html",
+            )
+        elif exports_enabled and charts_are_current and not inputs_stale:
+            st.caption(
+                "Generate the email draft after selecting the sensitivities "
+                "you want included."
+            )
+
+        if (
+            "deal_log_overview_df" in st.session_state
+            and "deal_log_slot_df" in st.session_state
+        ):
+            deal_log_csv = build_deal_log_csv(
+                opportunity_name=opportunity_name_clean,
+                overview_df=st.session_state["deal_log_overview_df"],
+                model_slot_df=st.session_state["deal_log_slot_df"],
+            )
+
+            st.download_button(
+                label="Download Deal Log CSV",
+                data=deal_log_csv,
+                file_name=st.session_state["deal_log_filename"],
+                mime="text/csv",
+                disabled=not exports_enabled,
+            )
+
+    else:
+        st.info(
+            "Sensitivities, charts, production graphs, and email export are disabled. "
+            "TC Assumptions Output and Quarterly Output are still available above."
+        )
+
+
+else:
+    st.info("Set your deal assumptions and slot inputs, then click Run Model.")
