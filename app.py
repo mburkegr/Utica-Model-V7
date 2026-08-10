@@ -886,6 +886,7 @@ def build_heatmap(
     y_format="dollar",
     base_x=None,
     base_y=None,
+    reverse_y=False,
 ):
     heatmap_df = df.copy()
 
@@ -992,6 +993,7 @@ def build_heatmap(
             tickfont=dict(size=15, color="black"),   # 🔥 slightly bigger
             type="category",
             automargin=True,
+            autorange="reversed" if reverse_y else True,
         ),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -4561,6 +4563,7 @@ if (
                         y_title=spec["y_title"],
                         x_format=spec["x_format"],
                         y_format=spec["y_format"],
+                        reverse_y=True,
                     )
                     moic_heatmap_current = build_heatmap(
                         saved_result["moic"],
@@ -4570,6 +4573,7 @@ if (
                         y_title=spec["y_title"],
                         x_format=spec["x_format"],
                         y_format=spec["y_format"],
+                        reverse_y=True,
                     )
 
                     irr_col, moic_col = st.columns(2)
