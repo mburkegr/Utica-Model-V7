@@ -4521,9 +4521,28 @@ if (
 
             if generate_clicked:
                 with st.spinner(f"Generating {spec['title']}..."):
+            
+                    sensitivity_slot_df = slot_df.copy()
+                    sensitivity_deal_inputs = deal_inputs.copy()
+            
+                    # Carry vs. D&C:
+                    # force acquisition price to $1/acre
+                    if spec["key"] == "carry_dc_custom":
+                        sensitivity_deal_inputs["use_bid_override"] = True
+                        sensitivity_deal_inputs["bid_override"] = 1.0
+            
+                    # $/Acre vs. D&C:
+                    # force carry to zero on every slot
+                    elif spec["key"] == "bid_dc_custom":
+                        sensitivity_deal_inputs["use_carry_override"] = False
+                        sensitivity_deal_inputs["carry_override_pct"] = 0.0
+            
+                        sensitivity_slot_df["carry_enabled"] = False
+                        sensitivity_slot_df["carry_wi_reversion_pct"] = 0.0
+            
                     irr_df, moic_df = run_two_way_sensitivity(
-                        slot_df=slot_df,
-                        deal_inputs=deal_inputs,
+                        slot_df=sensitivity_slot_df,
+                        deal_inputs=sensitivity_deal_inputs,
                         x_values=spec["x_values"],
                         x_variable=spec["x_variable"],
                         y_values=spec["y_values"],
