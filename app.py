@@ -895,6 +895,8 @@ def build_heatmap(
             return f"${int(v):,}" if float(v).is_integer() else f"${v:,.2f}"
         if fmt == "percent":
             return f"{v:.0%}"
+        if fmt == "percent1":
+            return f"{v:.1%}"
         if fmt == "float2":
             return f"{v:.2f}"
         if fmt == "date":
@@ -4469,7 +4471,7 @@ if (
                 "x_title": "D&C Costs ($/ft)",
                 "y_title": "Carry",
                 "x_format": "dollar",
-                "y_format": "percent",
+                "y_format": "percent1",
                 "enabled": carry_range_is_valid,
                 "caption": (
                     "Carry applies as a deal-level override to every included slot. "
