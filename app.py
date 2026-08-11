@@ -927,22 +927,37 @@ def build_heatmap(
             [1.00, "rgb(214,232,202)"],
         ]
     elif metric == "moic":
-        text_vals = heatmap_df.map(lambda x: f"{x:.2f}x" if pd.notnull(x) else "")
+        text_vals = heatmap_df.map(
+            lambda x: f"{x:.2f}x" if pd.notnull(x) else ""
+        )
+    
         zmin = min(0.0, float(heatmap_df.min().min()))
         zmax = max(2.0, float(heatmap_df.max().max()))
-
-        low_cut = 1.00
-        high_cut = 1.50
-
-        low_norm = clamp01((low_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.33
-        high_norm = clamp01((high_cut - zmin) / (zmax - zmin)) if zmax > zmin else 0.66
-
+    
+        # MOIC color thresholds:
+        # Red    = below 1.50x
+        # Yellow = 1.50x through 1.79x
+        # Green  = 1.80x+
+        low_cut = 1.50
+        high_cut = 1.80
+    
+        low_norm = (
+            clamp01((low_cut - zmin) / (zmax - zmin))
+            if zmax > zmin
+            else 0.50
+        )
+        high_norm = (
+            clamp01((high_cut - zmin) / (zmax - zmin))
+            if zmax > zmin
+            else 0.75
+        )
+    
         colorscale = [
-            [0.00, "rgb(255,180,180)"],
+            [0.00, "rgb(255,180,180)"],        # Red
             [low_norm, "rgb(255,180,180)"],
-            [low_norm, "rgb(255,255,204)"],
+            [low_norm, "rgb(255,255,204)"],    # Yellow starts at 1.50x
             [high_norm, "rgb(255,255,204)"],
-            [high_norm, "rgb(214,232,202)"],
+            [high_norm, "rgb(214,232,202)"],   # Green starts at 1.80x
             [1.00, "rgb(214,232,202)"],
         ]
     else:
