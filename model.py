@@ -409,7 +409,7 @@ def build_slot_ngl_factors(
         ).sum()
     )
 
-    ngl_pct_of_wti = aggregate_ngl_price * 42.0 / 60.0
+    ngl_pct_of_wti = aggregate_ngl_price * 42.0 / 70.0
 
     return {
         "recovery_case": recovery_case,
