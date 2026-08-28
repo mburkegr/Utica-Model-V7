@@ -3238,8 +3238,8 @@ if use_sev_tax_pct:
             "Oil Sev. Tax (%)",
             min_value=0.0,
             value=0.0,
-            step=0.25,
-            format="%.3f",
+            step=0.001,
+            format="%.5f",
             key="oil_sev_tax_pct_input",
             help="Enter 5 for 5% of net oil revenue.",
         )
@@ -3249,8 +3249,8 @@ if use_sev_tax_pct:
             "Gas Sev. Tax (%)",
             min_value=0.0,
             value=0.0,
-            step=0.25,
-            format="%.3f",
+            step=0.001,
+            format="%.5f",
             key="gas_sev_tax_pct_input",
             help="Enter 5 for 5% of net gas revenue.",
         )
@@ -3261,8 +3261,8 @@ else:
             "Oil Sev. Tax ($/bbl)",
             min_value=0.0,
             value=0.10,
-            step=0.01,
-            format="%.3f",
+            step=0.001,
+            format="%.5f",
             key="oil_sev_tax_fixed_input",
         )
 
@@ -3271,16 +3271,17 @@ else:
             "Gas Sev. Tax ($/mcf)",
             min_value=0.0,
             value=0.025,
-            step=0.005,
-            format="%.3f",
+            step=0.00001,
+            format="%.5f",
             key="gas_sev_tax_fixed_input",
         )
 
 ad_val_tax = st.sidebar.number_input(
     "Ad Valorem Tax (% of Net Revenue)",
     value=0.025,
-    step=0.005,
-    format="%.3f",
+    step=0.00001,
+    format="%.5f",
+    help="Entered as a decimal: 0.02500 = 2.5% of net revenue.",
 )
 
 st.sidebar.subheader("Ethane / NGL")
