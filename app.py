@@ -3325,10 +3325,11 @@ with st.sidebar.expander("NGL Component Prices", expanded=False):
 st.sidebar.subheader("Dale Promote / WI Reversion")
 
 st.sidebar.caption(
-    "Each Dale payout group earns its own reversion using positive OCF after "
-    "LOE and taxes. The OCF test uses the combined USEDC + Granite interest "
-    "before the Granite carry split. The additional WI is then taken "
-    "proportionately from each party's then-current WI."
+    "Each Dale payout group earns its own reversion using either positive OCF after "
+    "LOE and taxes or production revenue, depending on the payout-basis toggle. "
+    "Both tests use the combined USEDC + Granite interest before the Granite carry "
+    "split. The additional WI is then taken proportionately from each party's "
+    "then-current WI."
 )
 
 st.sidebar.caption(
@@ -3368,6 +3369,16 @@ promote_wi_reversion_pct = st.sidebar.number_input(
     ),
 )
 
+dale_payout_use_revenue = st.sidebar.toggle(
+    "Use Revenue for Dale Payout Hurdle",
+    value=False,
+    help=(
+        "OFF (default): cumulative positive OCF after LOE and taxes. "
+        "ON: cumulative production revenue after royalty/NRI, before LOE and taxes. "
+        "Both are measured on the combined GR Parties interest before the Granite carry split."
+    ),
+)
+
 promote_multiple = st.sidebar.number_input(
     "Dale Payout Multiple",
     min_value=0.01,
@@ -3375,9 +3386,8 @@ promote_multiple = st.sidebar.number_input(
     step=0.05,
     format="%.2f",
     help=(
-        "Cumulative positive OCF after LOE and taxes divided by acquisition "
-        "cost plus all funded D&C, including flagged Dale first-well carry costs, "
-        "calculated separately for each payout group."
+        "Cumulative payout-basis proceeds divided by acquisition cost plus all funded D&C, "
+        "including flagged Dale first-well carry costs, calculated separately for each payout group."
     ),
 )
 
@@ -3442,6 +3452,7 @@ deal_inputs = {
     "promote_enabled": False,  # set right before model run based on selected slots
     "promote_wi_reversion_pct": promote_wi_reversion_pct,
     "promote_multiple": promote_multiple,
+    "dale_payout_use_revenue": dale_payout_use_revenue,
 }
 
 
@@ -4021,7 +4032,8 @@ if (
             st.info(
                 f"WI reversion becomes effective {promote_effective_date:%m/%d/%Y}: "
                 f"{transferred_pct:.2f}% of each party's then-current WI transfers after its "
-                f"{float(deal_inputs.get('promote_multiple', 0.0)):.2f}x OCF hurdle. "
+                f"{float(deal_inputs.get('promote_multiple', 0.0)):.2f}x "
+                f"{'revenue' if bool(deal_inputs.get('dale_payout_use_revenue', False)) else 'OCF'} hurdle. "
                 "The date shown is the earliest active Dale payout group."
             )
         else:
