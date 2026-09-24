@@ -1023,11 +1023,15 @@ def build_slot_financials(
         df["slot_total_revenue"] + df["slot_loe"] + df["slot_tax"]
     )
 
-    # Dale payout is intentionally based on positive OCF after LOE and taxes,
-    # but before the USEDC-to-Granite carry split. It uses the combined USEDC +
-    # Granite / GR Parties interest after Dale's initial 1/16 has been removed.
+    # Dale payout basis is calculated before the USEDC-to-Granite carry split and
+    # uses the combined USEDC + Granite / GR Parties interest after Dale's initial
+    # 1/16 has been removed. OCF remains the default basis; production revenue can
+    # be selected at the deal level as an alternate payout test.
     df["slot_promote_ocf"] = (
         df["operating_cf"] * gr_parties_net_wells
+    )
+    df["slot_promote_revenue"] = (
+        df["total_revenue"] * gr_parties_net_wells
     )
 
     # Base D&C covers the combined USEDC + Granite interest for every well
@@ -1231,6 +1235,7 @@ def roll_up_deal(all_slots_df):
         "slot_tax",
         "slot_operating_profit",
         "slot_promote_ocf",
+        "slot_promote_revenue",
         "slot_base_capex",
         "slot_dale_carry_capex",
         "slot_capex",
@@ -1334,16 +1339,23 @@ def roll_up_deal(all_slots_df):
 def build_promote_schedule(promoted_rows, deal_settings):
     """Build a separate Dale payout schedule for each unit or well tranche.
 
-    The denominator is acquisition cost plus all D&C funded by USEDC,
+    The denominator is acquisition cost plus all D&C funded by the GR Parties,
     including the flagged first-well D&C carry for Dale's initial interest.
-    The numerator is positive OCF after LOE and taxes for the combined USEDC +
-    Granite / GR Parties interest, before the USEDC-to-Granite carry split.
+
+    By default, the numerator is positive OCF after LOE and taxes for the combined
+    GR Parties interest before the USEDC-to-Granite carry split. When the optional
+    revenue-basis toggle is enabled, the numerator instead uses production revenue
+    after royalty/NRI but before LOE and taxes on that same ownership basis.
+
     The additional WI back-in becomes effective in the following modeled month.
     """
     group_col = "dale_payout_group"
+    use_revenue = bool(deal_settings.get("dale_payout_use_revenue", False))
+    payout_col = "slot_promote_revenue" if use_revenue else "slot_promote_ocf"
+
     monthly = (
         promoted_rows.groupby([group_col, "date"], as_index=False)[
-            ["slot_promote_ocf", "slot_capex", "slot_asset_purchase"]
+            [payout_col, "slot_capex", "slot_asset_purchase"]
         ]
         .sum()
         .sort_values([group_col, "date"])
@@ -1354,9 +1366,8 @@ def build_promote_schedule(promoted_rows, deal_settings):
         -monthly["slot_asset_purchase"].clip(upper=0.0)
         -monthly["slot_capex"].clip(upper=0.0)
     )
-    monthly["promote_monthly_distributions"] = monthly[
-        "slot_promote_ocf"
-    ].clip(lower=0.0)
+    monthly["promote_monthly_distributions"] = monthly[payout_col].clip(lower=0.0)
+    monthly["promote_payout_basis"] = "Revenue" if use_revenue else "OCF"
 
     monthly["promote_cumulative_investment"] = monthly.groupby(group_col)[
         "promote_monthly_investment"
@@ -1404,6 +1415,7 @@ def build_promote_schedule(promoted_rows, deal_settings):
         [
             group_col,
             "date",
+            "promote_payout_basis",
             "promote_monthly_investment",
             "promote_monthly_distributions",
             "promote_cumulative_investment",
@@ -1446,6 +1458,7 @@ def apply_promote_to_slots(all_slots_df, deal_settings):
     df["post_promote_net_wells"] = df["pre_promote_net_wells"]
 
     schedule_defaults = {
+        "promote_payout_basis": "OCF",
         "promote_monthly_investment": 0.0,
         "promote_monthly_distributions": 0.0,
         "promote_cumulative_investment": 0.0,
@@ -1635,6 +1648,9 @@ def prepare_deal_settings(deal_inputs):
             float(deal_inputs.get("promote_multiple", 0.0))
             if promote_enabled
             else 0.0
+        ),
+        "dale_payout_use_revenue": bool(
+            deal_inputs.get("dale_payout_use_revenue", False)
         ),
     }
 
@@ -1910,6 +1926,8 @@ def build_slot_audit_view(all_slots_df):
         "well_shut_in",
         "pre_shut_in_operating_cf",
         "slot_promote_ocf",
+        "slot_promote_revenue",
+        "promote_payout_basis",
         "pre_promote_working_interest",
         "promote_wi_transferred",
         "post_promote_working_interest",
@@ -1997,6 +2015,7 @@ def build_deal_audit_view(deal_df):
         "slot_tax",
         "slot_operating_profit",
         "slot_promote_ocf",
+        "slot_promote_revenue",
         "slot_base_capex",
         "slot_dale_carry_capex",
         "slot_capex",
