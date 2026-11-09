@@ -51,6 +51,7 @@ def _load_price_file_cached(file_path, file_mtime):
     pricing_df = pd.read_excel(
         file_path,
         sheet_name="Data",
+        engine="openpyxl",
     )
 
     if pricing_df.empty:
